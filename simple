@@ -8,159 +8,128 @@ import os
 import time
 
 class AdaptiveTanh(nn.Module):
-    """Layer-wise Locally Adaptive Tanh Activation from the paper"""
+    """Layer-wise Locally Adaptive Tanh Activation (Jagtap et al. 2020)"""
     def __init__(self, n=10):
         super().__init__()
-        self.n = n
         self.a = nn.Parameter(torch.ones(1)*n)
         
     def forward(self, x):
         return torch.tanh(self.a * x)
 
 class PINN_LMD(nn.Module):
-    """Enhanced PINN model matching the paper's specifications"""
+    """Physics-Informed Neural Network for LMD (Li et al. 2023)"""
     def __init__(self, input_dim=4, hidden_dim=30, output_dim=1):
         super().__init__()
         
-        # Input normalization parameters
+        # Register buffers for scaling and normalization
         self.register_buffer('input_mean', torch.zeros(input_dim))
         self.register_buffer('input_std', torch.ones(input_dim))
-        
-        # Scaling factors (initialized to 1, will be set later)
         self.register_buffer('k_x', torch.ones(1))
         self.register_buffer('k_t', torch.ones(1))
         self.register_buffer('k_u', torch.ones(1))
         
-        # Network architecture
+        # Network architecture (30 neurons, 1 residual block)
         self.input_layer = nn.Linear(input_dim, hidden_dim)
-        
-        # Residual block
+        self.hidden1 = nn.Linear(hidden_dim, hidden_dim)
         self.res_block = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             AdaptiveTanh(),
             nn.Linear(hidden_dim, hidden_dim)
         )
-        
         self.output_layer = nn.Linear(hidden_dim, output_dim)
         
-        # Initialize weights
-        self._init_weights()
-        
-    def _init_weights(self):
-        # Xavier/Glorot initialization
+        # Initialize weights (Xavier/Glorot)
         nn.init.xavier_normal_(self.input_layer.weight)
         nn.init.zeros_(self.input_layer.bias)
-        
-        for layer in [self.res_block[0], self.res_block[2]]:
-            nn.init.xavier_normal_(layer.weight)
-            nn.init.zeros_(layer.bias)
-            
+        nn.init.xavier_normal_(self.hidden1.weight)
+        nn.init.zeros_(self.hidden1.bias)
+        nn.init.xavier_normal_(self.res_block[0].weight)
+        nn.init.zeros_(self.res_block[0].bias)
+        nn.init.xavier_normal_(self.res_block[2].weight)
+        nn.init.zeros_(self.res_block[2].bias)
         nn.init.xavier_normal_(self.output_layer.weight, gain=0.1)
         nn.init.zeros_(self.output_layer.bias)
         
     def set_scaling_factors(self, Lx, Ly, Lz, t1, t2, T_max):
-        """Set scaling factors according to paper's methodology"""
-        self.k_x.data = torch.tensor(1.0 / max(Lx, Ly, Lz), dtype=torch.float32)
-        self.k_t.data = torch.tensor(1.0 / (t1 + t2), dtype=torch.float32)
-        self.k_u.data = torch.tensor(1.0 / T_max, dtype=torch.float32)
+        """Set scaling factors as per Eq. (12) in paper"""
+        self.k_x.data = torch.tensor(1.0/max(Lx, Ly, Lz), dtype=torch.float32)
+        self.k_t.data = torch.tensor(1.0/(t1 + t2), dtype=torch.float32)
+        self.k_u.data = torch.tensor(1.0/T_max, dtype=torch.float32)
         
     def set_input_stats(self, mean, std):
         """Set input normalization statistics"""
-        self.input_mean.data.copy_(torch.tensor(mean, dtype=torch.float32))
-        self.input_std.data.copy_(torch.tensor(std, dtype=torch.float32))
+        self.input_mean.data.copy_(torch.as_tensor(mean, dtype=torch.float32))
+        self.input_std.data.copy_(torch.as_tensor(std, dtype=torch.float32))
         
     def forward(self, x):
         # Normalize and scale inputs
         x_norm = (x - self.input_mean) / self.input_std
         x_scaled = torch.cat([
             x_norm[:,:3] * self.k_x,  # x,y,z scaling
-            x_norm[:,3:4] * self.k_t  # t scaling
+            x_norm[:,3:4] * self.k_t   # t scaling
         ], dim=1)
         
-        # Forward pass through network
+        # Forward pass
         h = torch.tanh(self.input_layer(x_scaled))
+        h = torch.tanh(self.hidden1(h))
         
         # Residual block
         residual = h
         h = self.res_block(h) + residual
         h = torch.tanh(h)
         
-        # Output with sigmoid activation (0-1 range)
+        # Output with sigmoid (0-1 range)
         u_scaled = torch.sigmoid(self.output_layer(h))
         
-        # Unscale output temperature
+        # Unscale temperature output
         return u_scaled / self.k_u
 
 class LMDPhysics:
-    """Physics module implementing all LMD-specific equations"""
+    """Physics module implementing LMD-specific equations"""
     def __init__(self, params):
         self.params = params
-        
-        # Physical constants
         self.sigma_sb = 5.67e-8  # Stefan-Boltzmann constant
-        
-        # Domain parameters
-        self.Lx = params['Lx']
-        self.Ly = params['Ly']
-        self.Lz = params['Lz']
-        self.t1 = params['t1']
-        self.t2 = params['t2']
-        
-        # Reference values for normalization
-        self.Q_max = 5.0e11  # Max laser power density
-        self.T_ref = params['T0'] + 2500  # Reference temperature (ambient + max expected)
+        self.Lx, self.Ly, self.Lz = params['Lx'], params['Ly'], params['Lz']
+        self.t1, self.t2 = params['t1'], params['t2']
+        self.Q_max = 5.0e11  # Max laser power density for normalization
+        self.T_ref = 3000.0   # Reference temperature for scaling
         
     def thermal_conductivity(self, T):
-        """Temperature-dependent thermal conductivity from Table 2"""
-        # k(T) = 2.0e-5*T^2 - 0.0441*T + 49.94 (T < 1773.15 K)
-        # k(T) = 31.9 (T >= 1773.15 K)
-        k_low = 2.0e-5*T**2 - 0.0441*T + 49.94
-        k_high = torch.full_like(T, 31.9)
+        """Temperature-dependent k(T) from Table 2"""
+        k_low = 2.0e-5*T**2 - 0.0441*T + 49.94  # T < 1773.15K
+        k_high = torch.full_like(T, 31.9)        # T >= 1773.15K
         return torch.where(T < 1773.15, k_low, k_high)
         
     def specific_heat(self, T):
-        """Temperature-dependent specific heat from Table 2"""
-        # Cp(T) = 1.04e-4*T^2 - 0.3426*T + 314.2 (T < 1773.15 K)
-        # Cp(T) = 700 (T >= 1773.15 K)
-        cp_low = 1.04e-4*T**2 - 0.3426*T + 314.2
-        cp_high = torch.full_like(T, 700.0)
+        """Temperature-dependent Cp(T) from Table 2"""
+        cp_low = 1.04e-4*T**2 - 0.3426*T + 314.2  # T < 1773.15K
+        cp_high = torch.full_like(T, 700.0)       # T >= 1773.15K
         return torch.where(T < 1773.15, cp_low, cp_high)
         
     def laser_heat_source(self, x, y, z, t):
         """Gaussian laser heat source from Eq. (4)"""
-        v = self.params['v']
-        P = self.params['P']
-        eta = self.params['eta']
-        Ra, Rb, Rc = self.params['Ra'], self.params['Rb'], self.params['Rc']
+        v, P = self.params['v'], self.params['P']
+        eta, Ra, Rb, Rc = self.params['eta'], self.params['Ra'], self.params['Rb'], self.params['Rc']
+        x0, y0, z0 = 0.0, self.Ly/2, 0.0  # Laser path center
         
-        # Laser position (moving along x-axis at y=Ly/2, z=0)
-        x0, y0, z0 = 0.0, self.Ly/2, 0.0
-        
-        # Time-dependent intensity (active only during deposition)
+        # Active only during deposition
         active = (t <= self.t1).float()
         
-        # Ellipsoidal Gaussian from Eq. (4)
-        dx = (x - (v*t + x0)) / Ra
-        dy = (y - y0) / Rb
-        dz = (z - z0) / Rc
-        r_sq = dx**2 + dy**2 + dz**2
-        
-        Q = (6*np.sqrt(3)*eta*P / (np.pi*np.sqrt(np.pi)*Ra*Rb*Rc)) * torch.exp(-3*r_sq) * active
+        # Ellipsoidal Gaussian (Eq. 4)
+        r_sq = ((x - (v*t + x0))/Ra)**2 + ((y - y0)/Rb)**2 + ((z - z0)/Rc)**2
+        Q = (6*np.sqrt(3)*eta*P/(np.pi*np.sqrt(np.pi)*Ra*Rb*Rc)) * torch.exp(-3*r_sq) * active
         
         return Q / self.Q_max  # Normalized
     
     def compute_derivatives(self, model, x, y, z, t):
-        """Compute all required derivatives using autodiff"""
-        # Requires grad for autodiff
+        """Compute derivatives via automatic differentiation"""
         x_t = x.clone().requires_grad_(True)
         y_t = y.clone().requires_grad_(True)
         z_t = z.clone().requires_grad_(True)
         t_t = t.clone().requires_grad_(True)
         
-        # Stack inputs and forward pass
         inputs = torch.stack([x_t, y_t, z_t, t_t], dim=1)
-        u = model(inputs)
-        T = u  # Direct temperature output
+        T = model(inputs)
         
         # First derivatives
         dT_dx = grad(T, x_t, grad_outputs=torch.ones_like(T), create_graph=True)[0]
@@ -176,8 +145,7 @@ class LMDPhysics:
         return T, dT_dt, dT_dx, dT_dy, dT_dz, d2T_dx2, d2T_dy2, d2T_dz2
     
     def pde_residual(self, model, x, y, z, t):
-        """Compute PDE residual from Eq. (1) and (5)"""
-        # Compute derivatives and temperature
+        """PDE residual from Eq. (1) and (5)"""
         T, dT_dt, dT_dx, dT_dy, dT_dz, d2T_dx2, d2T_dy2, d2T_dz2 = \
             self.compute_derivatives(model, x, y, z, t)
         
@@ -189,13 +157,9 @@ class LMDPhysics:
         # Heat source term
         Q = self.laser_heat_source(x, y, z, t)
         
-        # Laplacian term
-        laplacian = d2T_dx2 + d2T_dy2 + d2T_dz2
-        
-        # Heat conduction equation residual (normalized)
-        residual = (rho * Cp * dT_dt - k * laplacian - Q * self.Q_max) / self.Q_max
-        
-        return residual
+        # Heat equation residual (normalized)
+        residual = (rho * Cp * dT_dt - k * (d2T_dx2 + d2T_dy2 + d2T_dz2) - Q * self.Q_max)
+        return residual / self.Q_max
     
     def ic_residual(self, model, x, y, z, t):
         """Initial condition residual from Eq. (2) and (6)"""
@@ -205,9 +169,7 @@ class LMDPhysics:
     
     def bc_residual(self, model, x, y, z, t):
         """Boundary condition residual from Eq. (3) and (7)"""
-        # Compute derivatives and temperature
-        T, _, dT_dx, dT_dy, dT_dz, _, _, _ = \
-            self.compute_derivatives(model, x, y, z, t)
+        T, _, dT_dx, dT_dy, dT_dz, _, _, _ = self.compute_derivatives(model, x, y, z, t)
         
         # Boundary detection
         tol = 1e-4
@@ -221,54 +183,45 @@ class LMDPhysics:
         # Initialize residual
         bc_residual = torch.zeros_like(T)
         
-        # Get material properties
+        # Material properties
         k = self.thermal_conductivity(T)
         h = self.params['h']
         epsilon = self.params['epsilon']
         T0 = self.params['T0']
         
-        # x=0: Insulated (dT/dx = 0)
-        bc_residual = torch.where(is_x_min, dT_dx, bc_residual)
-        
-        # x=Lx: Convection + radiation
+        # Boundary conditions
         q_conv = h * (T - T0)
         q_rad = epsilon * self.sigma_sb * (T**4 - T0**4)
-        bc_residual = torch.where(is_x_max, k*dT_dx + q_conv + q_rad, bc_residual)
         
-        # y=0 and y=Ly: Insulated (dT/dy = 0)
-        bc_residual = torch.where(is_y_min | is_y_max, dT_dy, bc_residual)
+        # Apply BCs
+        bc_residual = torch.where(is_x_min, dT_dx, bc_residual)  # x=0: dT/dx=0
+        bc_residual = torch.where(is_x_max, k*dT_dx + q_conv + q_rad, bc_residual)  # x=Lx
+        bc_residual = torch.where(is_y_min | is_y_max, dT_dy, bc_residual)  # y=0, y=Ly
+        bc_residual = torch.where(is_z_min, dT_dz, bc_residual)  # z=0
+        bc_residual = torch.where(is_z_max, k*dT_dz + q_conv + q_rad, bc_residual)  # z=Lz
         
-        # z=0: Insulated (dT/dz = 0)
-        bc_residual = torch.where(is_z_min, dT_dz, bc_residual)
-        
-        # z=Lz: Convection + radiation
-        bc_residual = torch.where(is_z_max, k*dT_dz + q_conv + q_rad, bc_residual)
-        
-        return bc_residual / self.Q_max  # Normalized
+        return bc_residual / self.Q_max
 
-def generate_training_data(params, n_pde=20000, n_ic=30000, n_bc=10000, device='cpu'):
-    """Generate training points with focused sampling around laser path"""
+def generate_training_points(params, n_pde=20000, n_ic=30000, n_bc=10000, device='cpu'):
+    """Generate training points with focused sampling (Sec. 4)"""
     Lx, Ly, Lz = params['Lx'], params['Ly'], params['Lz']
     t1, t2 = params['t1'], params['t2']
     t_max = t1 + t2
     v = params['v']
     
-    # PDE points - focused sampling around laser path
-    # Laser region (70%)
+    # PDE points (70% laser region, 20% surface, 10% uniform)
     n_laser = int(0.7 * n_pde)
     t_laser = torch.rand(n_laser, device=device).pow(2) * t1  # More early samples
     x_laser = v * t_laser + 0.0005 * torch.randn(n_laser, device=device)
     y_laser = Ly/2 + 0.001 * torch.randn(n_laser, device=device)
     z_laser = 0.0002 * torch.rand(n_laser, device=device).pow(3)
     
-    # Surface region (20%)
     n_surface = int(0.2 * n_pde)
     x_surface = torch.rand(n_surface, device=device) * Lx
     y_surface = torch.rand(n_surface, device=device) * Ly
     z_surface = 0.0001 * torch.rand(n_surface, device=device).pow(4)
     t_surface = torch.rand(n_surface, device=device) * t_max
     
-    # Uniform region (10%)
     n_uniform = n_pde - n_laser - n_surface
     x_uniform = torch.rand(n_uniform, device=device) * Lx
     y_uniform = torch.rand(n_uniform, device=device) * Ly
@@ -276,70 +229,73 @@ def generate_training_data(params, n_pde=20000, n_ic=30000, n_bc=10000, device='
     t_uniform = torch.rand(n_uniform, device=device) * t_max
     
     # Combine PDE points
-    x_pde = torch.cat([x_laser, x_surface, x_uniform])
-    y_pde = torch.cat([y_laser, y_surface, y_uniform])
-    z_pde = torch.cat([z_laser, z_surface, z_uniform])
-    t_pde = torch.cat([t_laser, t_surface, t_uniform])
-    X_pde = torch.stack([x_pde, y_pde, z_pde, t_pde], dim=1)
+    X_pde = torch.stack([
+        torch.cat([x_laser, x_surface, x_uniform]),
+        torch.cat([y_laser, y_surface, y_uniform]),
+        torch.cat([z_laser, z_surface, z_uniform]),
+        torch.cat([t_laser, t_surface, t_uniform])
+    ], dim=1)
     
     # Initial condition points (t=0)
-    x_ic = torch.rand(n_ic, device=device) * Lx
-    y_ic = torch.rand(n_ic, device=device) * Ly
-    z_ic = torch.rand(n_ic, device=device) * Lz
-    t_ic = torch.zeros(n_ic, device=device)
-    X_ic = torch.stack([x_ic, y_ic, z_ic, t_ic], dim=1)
+    X_ic = torch.stack([
+        torch.rand(n_ic, device=device) * Lx,
+        torch.rand(n_ic, device=device) * Ly,
+        torch.rand(n_ic, device=device) * Lz,
+        torch.zeros(n_ic, device=device)
+    ], dim=1)
     
-    # Boundary condition points
-    n_per_face = n_bc // 6  # 6 faces
-    
-    # Generate times for BC points
+    # Boundary condition points (6 faces)
+    n_per_face = n_bc // 6
     t_bc = torch.rand(n_per_face, device=device) * t_max
     
-    # x=0 and x=Lx faces
-    x_bc1 = torch.zeros(n_per_face, device=device)
-    x_bc2 = torch.ones(n_per_face, device=device) * Lx
-    y_bc = torch.rand(2*n_per_face, device=device) * Ly
-    z_bc = torch.rand(2*n_per_face, device=device) * Lz
-    t_bc1 = t_bc.repeat(2)
+    # Generate points for each face
+    faces = []
+    for i in range(6):
+        if i == 0:  # x=0
+            x = torch.zeros(n_per_face, device=device)
+            y = torch.rand(n_per_face, device=device) * Ly
+            z = torch.rand(n_per_face, device=device) * Lz
+        elif i == 1:  # x=Lx
+            x = torch.ones(n_per_face, device=device) * Lx
+            y = torch.rand(n_per_face, device=device) * Ly
+            z = torch.rand(n_per_face, device=device) * Lz
+        elif i == 2:  # y=0
+            x = torch.rand(n_per_face, device=device) * Lx
+            y = torch.zeros(n_per_face, device=device)
+            z = torch.rand(n_per_face, device=device) * Lz
+        elif i == 3:  # y=Ly
+            x = torch.rand(n_per_face, device=device) * Lx
+            y = torch.ones(n_per_face, device=device) * Ly
+            z = torch.rand(n_per_face, device=device) * Lz
+        elif i == 4:  # z=0
+            x = torch.rand(n_per_face, device=device) * Lx
+            y = torch.rand(n_per_face, device=device) * Ly
+            z = torch.zeros(n_per_face, device=device)
+        else:  # z=Lz
+            x = torch.rand(n_per_face, device=device) * Lx
+            y = torch.rand(n_per_face, device=device) * Ly
+            z = torch.ones(n_per_face, device=device) * Lz
+        
+        faces.append(torch.stack([x, y, z, t_bc], dim=1))
     
-    # y=0 and y=Ly faces
-    x_bc3 = torch.rand(2*n_per_face, device=device) * Lx
-    y_bc1 = torch.zeros(n_per_face, device=device)
-    y_bc2 = torch.ones(n_per_face, device=device) * Ly
-    z_bc1 = torch.rand(2*n_per_face, device=device) * Lz
-    t_bc2 = t_bc.repeat(2)
-    
-    # z=0 and z=Lz faces
-    x_bc4 = torch.rand(2*n_per_face, device=device) * Lx
-    y_bc3 = torch.rand(2*n_per_face, device=device) * Ly
-    z_bc2 = torch.zeros(n_per_face, device=device)
-    z_bc3 = torch.ones(n_per_face, device=device) * Lz
-    t_bc3 = t_bc.repeat(2)
-    
-    # Combine all BC points
-    X_bc = torch.cat([
-        torch.stack([x_bc1, y_bc[:n_per_face], z_bc[:n_per_face], t_bc[:n_per_face]], dim=1),
-        torch.stack([x_bc2, y_bc[n_per_face:], z_bc[n_per_face:], t_bc[:n_per_face]], dim=1),
-        torch.stack([x_bc3[:n_per_face], y_bc1, z_bc1[:n_per_face], t_bc[:n_per_face]], dim=1),
-        torch.stack([x_bc3[n_per_face:], y_bc2, z_bc1[n_per_face:], t_bc[:n_per_face]], dim=1),
-        torch.stack([x_bc4[:n_per_face], y_bc3[:n_per_face], z_bc2, t_bc[:n_per_face]], dim=1),
-        torch.stack([x_bc4[n_per_face:], y_bc3[n_per_face:], z_bc3, t_bc[:n_per_face]], dim=1)
-    ])
+    X_bc = torch.cat(faces)
     
     return X_pde, X_ic, X_bc
 
-def train_pinn(model, physics, X_pde, X_ic, X_bc, device, epochs=10000, lbfgs_epochs=16000):
-    """Two-phase training as in the paper"""
+def train_pinn(model, physics, X_pde, X_ic, X_bc, device, 
+              epochs=10000, lbfgs_epochs=16000, print_freq=100):
+    """Two-phase training as per paper (Sec. 4)"""
     # Unpack coordinates
     x_pde, y_pde, z_pde, t_pde = X_pde[:,0], X_pde[:,1], X_pde[:,2], X_pde[:,3]
     x_ic, y_ic, z_ic, t_ic = X_ic[:,0], X_ic[:,1], X_ic[:,2], X_ic[:,3]
     x_bc, y_bc, z_bc, t_bc = X_bc[:,0], X_bc[:,1], X_bc[:,2], X_bc[:,3]
     
-    # Loss weights (from paper)
-    loss_weights = {'pde': 1.0, 'ic': 1.0, 'bc': 10.0}
+    # Loss weights (paper values)
+    loss_weights = {'pde': 5.0, 'ic': 1.0, 'bc': 10.0}
     
     # Adam optimizer first
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=500)
     
     # Loss history
     history = {'total': [], 'pde': [], 'ic': [], 'bc': []}
@@ -348,7 +304,7 @@ def train_pinn(model, physics, X_pde, X_ic, X_bc, device, epochs=10000, lbfgs_ep
     for epoch in range(epochs):
         optimizer.zero_grad()
         
-        # Compute all residuals
+        # Compute residuals
         loss_pde = torch.mean(physics.pde_residual(model, x_pde, y_pde, z_pde, t_pde)**2)
         loss_ic = torch.mean(physics.ic_residual(model, x_ic, y_ic, z_ic, t_ic)**2)
         loss_bc = torch.mean(physics.bc_residual(model, x_bc, y_bc, z_bc, t_bc)**2)
@@ -361,6 +317,7 @@ def train_pinn(model, physics, X_pde, X_ic, X_bc, device, epochs=10000, lbfgs_ep
         # Backpropagation
         total_loss.backward()
         optimizer.step()
+        scheduler.step(total_loss)
         
         # Record history
         history['total'].append(total_loss.item())
@@ -368,20 +325,27 @@ def train_pinn(model, physics, X_pde, X_ic, X_bc, device, epochs=10000, lbfgs_ep
         history['ic'].append(loss_ic.item())
         history['bc'].append(loss_bc.item())
         
-        if (epoch+1) % 1000 == 0:
+        # Print progress
+        if (epoch+1) % print_freq == 0:
             print(f"Epoch {epoch+1}/{epochs}: Loss={total_loss.item():.3e} "
-                  f"(PDE={loss_pde.item():.3e}, IC={loss_ic.item():.3e}, BC={loss_bc.item():.3e})")
+                 f"(PDE={loss_pde.item():.3e}, IC={loss_ic.item():.3e}, BC={loss_bc.item():.3e})")
     
     # L-BFGS optimization
     if lbfgs_epochs > 0:
         print("\nStarting L-BFGS optimization...")
-        optimizer = optim.LBFGS(model.parameters(), 
-                              max_iter=lbfgs_epochs,
-                              history_size=100,
-                              line_search_fn='strong_wolfe')
+        lbfgs_optimizer = optim.LBFGS(model.parameters(), 
+                                    max_iter=lbfgs_epochs,
+                                    max_eval=lbfgs_epochs*2,  # Allow more evaluations
+                                    tolerance_grad=1e-7,      # Tighter tolerance
+                                    tolerance_change=1e-14,    # Tighter tolerance
+                                    history_size=50,
+                                    line_search_fn='strong_wolfe')
+        
+        # Progress tracking for L-BFGS
+        lbfgs_iter = [0]
         
         def closure():
-            optimizer.zero_grad()
+            lbfgs_optimizer.zero_grad()
             loss_pde = torch.mean(physics.pde_residual(model, x_pde, y_pde, z_pde, t_pde)**2)
             loss_ic = torch.mean(physics.ic_residual(model, x_ic, y_ic, z_ic, t_ic)**2)
             loss_bc = torch.mean(physics.bc_residual(model, x_bc, y_bc, z_bc, t_bc)**2)
@@ -390,27 +354,38 @@ def train_pinn(model, physics, X_pde, X_ic, X_bc, device, epochs=10000, lbfgs_ep
                          loss_weights['bc'] * loss_bc)
             total_loss.backward()
             
-            # Record history
-            history['total'].append(total_loss.item())
-            history['pde'].append(loss_pde.item())
-            history['ic'].append(loss_ic.item())
-            history['bc'].append(loss_bc.item())
+            # Record history (only on certain iterations to avoid slowdown)
+            if lbfgs_iter[0] % 10 == 0:
+                history['total'].append(total_loss.item())
+                history['pde'].append(loss_pde.item())
+                history['ic'].append(loss_ic.item())
+                history['bc'].append(loss_bc.item())
+                
+                if lbfgs_iter[0] % print_freq == 0:
+                    print(f"L-BFGS Iter {lbfgs_iter[0]}: Loss={total_loss.item():.3e} "
+                         f"(PDE={loss_pde.item():.3e}, IC={loss_ic.item():.3e}, BC={loss_bc.item():.3e})")
             
-            if len(history['total']) % 1000 == 0:
-                print(f"L-BFGS Iter {len(history['total'])}: Loss={total_loss.item():.3e}")
+            lbfgs_iter[0] += 1
             return total_loss
         
-        optimizer.step(closure)
+        # Run L-BFGS optimization with manual step to ensure it executes
+        try:
+            # This explicit step() call will force L-BFGS to run
+            lbfgs_optimizer.step(closure)
+            print(f"L-BFGS completed with {lbfgs_iter[0]} iterations")
+        except Exception as e:
+            print(f"L-BFGS optimization failed: {e}")
+            print("Check for numerical instabilities or try reducing lbfgs_epochs")
     
     return history
 
-def plot_temperature_field(model, physics, time, save_path=None, plane='xy'):
-    """Visualize temperature field at given time"""
+def plot_temperature_field(model, physics, time, plane='xy', save_path=None):
+    """Visualize temperature field as in paper figures"""
     model.eval()
     device = next(model.parameters()).device
     
     # Create grid
-    n_points = 100
+    n_points = 200
     if plane == 'xy':
         # Top surface (z=0)
         x = torch.linspace(0, physics.Lx, n_points, device=device)
@@ -428,31 +403,80 @@ def plot_temperature_field(model, physics, time, save_path=None, plane='xy'):
     else:
         raise ValueError("plane must be 'xy' or 'xz'")
     
-    # Flatten grid and add time
+    # Predict temperatures
     grid_points = torch.stack([X.flatten(), Y.flatten(), Z.flatten(), 
                              torch.ones_like(X.flatten()) * time], dim=1)
-    
-    # Predict temperatures
     with torch.no_grad():
         T = model(grid_points).cpu().numpy().reshape(X.shape)
     
-    # Plot
-    plt.figure(figsize=(10, 8))
-    plt.pcolormesh(X.cpu().numpy(), Y.cpu().numpy(), T, shading='auto', cmap='hot')
-    plt.colorbar(label='Temperature (K)')
+    # Create plot
+    plt.figure(figsize=(12, 8))
+    
+    # Temperature contour
+    levels = np.linspace(physics.params['T0'], 3000, 50)
+    contour = plt.contourf(X.cpu().numpy(), Y.cpu().numpy(), T, 
+                          levels=levels, cmap='inferno')
+    
+    # Melt pool contour (Tm=1730K)
+    if plane == 'xy':
+        plt.contour(X.cpu().numpy(), Y.cpu().numpy(), T, 
+                   levels=[physics.params['Tm']], colors='cyan', linewidths=2)
+        
+        # Laser position
+        if time <= physics.t1:
+            laser_x = physics.params['v'] * time
+            laser_y = physics.Ly / 2
+            plt.plot(laser_x, laser_y, 'wo', markersize=8, label='Laser position')
+            plt.legend()
+    
+    # Formatting
+    plt.colorbar(contour, label='Temperature (K)')
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
     plt.title(f'Temperature Field at t={time:.2f}s (plane={plane})')
-    
-    # Add laser position if in deposition phase
-    if time <= physics.t1 and plane == 'xy':
-        laser_x = physics.params['v'] * time
-        laser_y = physics.Ly / 2
-        plt.plot(laser_x, laser_y, 'wo', markersize=8, label='Laser position')
-        plt.legend()
+    plt.gca().set_aspect('equal')
+    plt.grid(True, alpha=0.3)
     
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.show()
+
+def plot_loss_history(history, save_path=None):
+    """
+    Plot loss curves similar to Fig. 4 in the paper
+    """
+    plt.figure(figsize=(10, 6))
+    
+    # Log-scale for y-axis to match the paper
+    epochs = range(len(history['total']))
+    
+    # Plot all loss components
+    plt.semilogy(epochs, history['pde'], label='PDE loss', color='green', linewidth=1.5)
+    plt.semilogy(epochs, history['ic'], label='IC loss', color='cyan', linewidth=1.5)
+    plt.semilogy(epochs, history['bc'], label='BC loss', color='red', linewidth=1.5)
+    plt.semilogy(epochs, history['total'], label='Total loss', color='blue', linewidth=1.5)
+    
+    # Add Adam/L-BFGS transition marker
+    if len(epochs) > 4000:  # Assuming 4000 Adam epochs as in your code
+        plt.axvline(x=4000, color='black', linestyle='--', alpha=0.5)
+        plt.text(4000+100, max(history['total']), 'Adam → L-BFGS', 
+                fontsize=10, rotation=0, verticalalignment='top')
+    
+    # Formatting to match the paper style
+    plt.xlabel('Epochs', fontsize=12)
+    plt.ylabel('Training loss (log)', fontsize=12)
+    plt.grid(True, which="both", ls="--", alpha=0.3)
+    plt.legend(fontsize=10)
+    plt.title('Loss curve of the PINN model in the deposition stage', fontsize=14)
+    
+    # Set y-axis limits similar to the paper
+    plt.ylim(min(min(history['bc'])*0.5, 1e-10), max(history['total'][:10])*2)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    
     plt.show()
 
 def main():
@@ -460,68 +484,45 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Parameters from Table 2 in the paper
+    # Parameters from Table 2 in paper
     params = {
-        'rho': 7780.0,                # Density (kg/m^3)
-        'eta': 0.75,                  # Laser absorption coefficient
-        'P': 2000.0,                  # Laser power (W)
-        'v': 8.0e-3,                  # Scanning speed (m/s)
-        'Ra': 3.0e-3,                 # Laser spot radius in x (m)
-        'Rb': 3.0e-3,                 # Laser spot radius in y (m)
-        'Rc': 1.0e-3,                 # Laser spot radius in z (m)
-        'h': 20.0,                    # Convection coefficient (W/(m^2·K))
-        'epsilon': 0.85,              # Emissivity
-        'T0': 293.15,                 # Initial/ambient temperature (K)
-        'Tm': 1730.0,                 # Melting temperature (K)
-        'Ts': 1690.0,                 # Solidus temperature (K)
-        'Lx': 0.04,                   # Domain length in x (m)
-        'Ly': 0.02,                   # Domain width in y (m)
-        'Lz': 0.005,                  # Domain height in z (m)
-        't1': 2.0,                    # Deposition time (s)
-        't2': 10.0                    # Cooling time (s)
+        'rho': 7780.0, 'eta': 0.75, 'P': 2000.0, 'v': 8.0e-3,
+        'Ra': 3.0e-3, 'Rb': 3.0e-3, 'Rc': 1.0e-3,
+        'h': 20.0, 'epsilon': 0.85, 'T0': 293.15,
+        'Tm': 1730.0, 'Ts': 1690.0,
+        'Lx': 0.04, 'Ly': 0.02, 'Lz': 0.005,
+        't1': 2.0, 't2': 10.0
     }
     
     # Initialize model
     model = PINN_LMD().to(device)
     
-    # Set scaling factors
-    model.set_scaling_factors(params['Lx'], params['Ly'], params['Lz'], 
+    # Set scaling factors (Eq. 12)
+    model.set_scaling_factors(params['Lx'], params['Ly'], params['Lz'],
                             params['t1'], params['t2'], 3000.0)
     
-    # Set input normalization (mean and std of coordinates)
-    input_mean = torch.tensor([params['Lx']/2, params['Ly']/2, 
-                              params['Lz']/2, params['t1']/2])
-    input_std = torch.tensor([params['Lx'], params['Ly'], 
-                            params['Lz'], params['t1'] + params['t2']])
+    # Set input normalization
+    input_mean = [params['Lx']/2, params['Ly']/2, params['Lz']/2, params['t1']/2]
+    input_std = [params['Lx'], params['Ly'], params['Lz'], params['t1'] + params['t2']]
     model.set_input_stats(input_mean, input_std)
     
     # Initialize physics
     physics = LMDPhysics(params)
     
-    # Generate training data (same counts as paper)
+    # Generate training data (paper counts)
     print("Generating training data...")
-    X_pde, X_ic, X_bc = generate_training_data(
-        params, n_pde=20000, n_ic=30000, n_bc=10000, device=device)
+    X_pde, X_ic, X_bc = generate_training_points(
+        params, n_pde=3000, n_ic=4000, n_bc=2000, device=device)
     
-    # Train the model
+    # Train the model (paper epochs)
     print("Starting training...")
-    history = train_pinn(model, physics, X_pde, X_ic, X_bc, 
-                        device, epochs=10000, lbfgs_epochs=16000)
+    history = train_pinn(model, physics, X_pde, X_ic, X_bc,
+                        device, epochs=4000, lbfgs_epochs=4000)
     
-    # Plot loss history
-    plt.figure(figsize=(10,6))
-    plt.semilogy(history['total'], label='Total Loss')
-    plt.semilogy(history['pde'], label='PDE Loss')
-    plt.semilogy(history['ic'], label='IC Loss')
-    plt.semilogy(history['bc'], label='BC Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss (log scale)')
-    plt.title('Training Loss History')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
+    # Plot results
+    plot_loss_history(history)
     
-    # Visualize results at key time points
+    # Visualize at key time points
     for t in [0.5, 1.0, 2.0]:
         plot_temperature_field(model, physics, t, plane='xy')
         plot_temperature_field(model, physics, t, plane='xz')
