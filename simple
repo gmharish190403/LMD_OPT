@@ -336,7 +336,7 @@ def train_pinn(model, physics, X_pde, X_ic, X_bc, device,
         lbfgs_optimizer = optim.LBFGS(model.parameters(), 
                                     max_iter=lbfgs_epochs,
                                     max_eval=lbfgs_epochs*2,  # Allow more evaluations
-                                    tolerance_grad=1e-7,      # Tighter tolerance
+                                    tolerance_grad=1e-11,      # Tighter tolerance
                                     tolerance_change=1e-14,    # Tighter tolerance
                                     history_size=50,
                                     line_search_fn='strong_wolfe')
@@ -512,12 +512,12 @@ def main():
     # Generate training data (paper counts)
     print("Generating training data...")
     X_pde, X_ic, X_bc = generate_training_points(
-        params, n_pde=3000, n_ic=4000, n_bc=2000, device=device)
+        params, n_pde=20000, n_ic=30000, n_bc=10000, device=device)
     
     # Train the model (paper epochs)
     print("Starting training...")
     history = train_pinn(model, physics, X_pde, X_ic, X_bc,
-                        device, epochs=4000, lbfgs_epochs=4000)
+                        device, epochs=10000, lbfgs_epochs=16000)
     
     # Plot results
     plot_loss_history(history)
