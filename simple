@@ -16,6 +16,28 @@ class AdaptiveTanh(nn.Module):
     def forward(self, x):
         return torch.tanh(self.a * x)
 
+class ResidualBlock(nn.Module):
+    """Residual block with adaptive activation"""
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.layer1 = nn.Linear(hidden_dim, hidden_dim)
+        self.activation = AdaptiveTanh()
+        self.layer2 = nn.Linear(hidden_dim, hidden_dim)
+        
+        # Initialize weights (Xavier/Glorot)
+        nn.init.xavier_normal_(self.layer1.weight)
+        nn.init.zeros_(self.layer1.bias)
+        nn.init.xavier_normal_(self.layer2.weight)
+        nn.init.zeros_(self.layer2.bias)
+        
+    def forward(self, x):
+        identity = x
+        out = self.layer1(x)
+        out = self.activation(out)
+        out = self.layer2(out)
+        out += identity  # Skip connection
+        return out
+
 class PINN_LMD(nn.Module):
     """Physics-Informed Neural Network for LMD (Li et al. 2023)"""
     def __init__(self, input_dim=4, hidden_dim=30, output_dim=1):
@@ -31,11 +53,7 @@ class PINN_LMD(nn.Module):
         # Network architecture (30 neurons, 1 residual block)
         self.input_layer = nn.Linear(input_dim, hidden_dim)
         self.hidden1 = nn.Linear(hidden_dim, hidden_dim)
-        self.res_block = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            AdaptiveTanh(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
+        self.res_block = ResidualBlock(hidden_dim)
         self.output_layer = nn.Linear(hidden_dim, output_dim)
         
         # Initialize weights (Xavier/Glorot)
@@ -43,10 +61,6 @@ class PINN_LMD(nn.Module):
         nn.init.zeros_(self.input_layer.bias)
         nn.init.xavier_normal_(self.hidden1.weight)
         nn.init.zeros_(self.hidden1.bias)
-        nn.init.xavier_normal_(self.res_block[0].weight)
-        nn.init.zeros_(self.res_block[0].bias)
-        nn.init.xavier_normal_(self.res_block[2].weight)
-        nn.init.zeros_(self.res_block[2].bias)
         nn.init.xavier_normal_(self.output_layer.weight, gain=0.1)
         nn.init.zeros_(self.output_layer.bias)
         
@@ -74,8 +88,7 @@ class PINN_LMD(nn.Module):
         h = torch.tanh(self.hidden1(h))
         
         # Residual block
-        residual = h
-        h = self.res_block(h) + residual
+        h = self.res_block(h)
         h = torch.tanh(h)
         
         # Output with sigmoid (0-1 range)
@@ -122,25 +135,32 @@ class LMDPhysics:
         return Q / self.Q_max  # Normalized
     
     def compute_derivatives(self, model, x, y, z, t):
-        """Compute derivatives via automatic differentiation"""
-        x_t = x.clone().requires_grad_(True)
-        y_t = y.clone().requires_grad_(True)
-        z_t = z.clone().requires_grad_(True)
-        t_t = t.clone().requires_grad_(True)
+        """Compute derivatives via automatic differentiation (optimized)"""
+        # Store coordinates in a dictionary for cleaner code
+        coords = {}
+        coords['x'] = x.clone().requires_grad_(True)
+        coords['y'] = y.clone().requires_grad_(True)
+        coords['z'] = z.clone().requires_grad_(True)
+        coords['t'] = t.clone().requires_grad_(True)
         
-        inputs = torch.stack([x_t, y_t, z_t, t_t], dim=1)
+        inputs = torch.stack([coords['x'], coords['y'], coords['z'], coords['t']], dim=1)
         T = model(inputs)
         
         # First derivatives
-        dT_dx = grad(T, x_t, grad_outputs=torch.ones_like(T), create_graph=True)[0]
-        dT_dy = grad(T, y_t, grad_outputs=torch.ones_like(T), create_graph=True)[0]
-        dT_dz = grad(T, z_t, grad_outputs=torch.ones_like(T), create_graph=True)[0]
-        dT_dt = grad(T, t_t, grad_outputs=torch.ones_like(T), create_graph=True)[0]
+        grad_outputs = torch.ones_like(T)
+        first_derivs = torch.autograd.grad(
+            outputs=T, 
+            inputs=[coords['x'], coords['y'], coords['z'], coords['t']],
+            grad_outputs=grad_outputs,
+            create_graph=True
+        )
+        
+        dT_dx, dT_dy, dT_dz, dT_dt = first_derivs
         
         # Second derivatives
-        d2T_dx2 = grad(dT_dx, x_t, grad_outputs=torch.ones_like(dT_dx), create_graph=True)[0]
-        d2T_dy2 = grad(dT_dy, y_t, grad_outputs=torch.ones_like(dT_dy), create_graph=True)[0]
-        d2T_dz2 = grad(dT_dz, z_t, grad_outputs=torch.ones_like(dT_dz), create_graph=True)[0]
+        d2T_dx2 = grad(dT_dx, coords['x'], grad_outputs=torch.ones_like(dT_dx), create_graph=True)[0]
+        d2T_dy2 = grad(dT_dy, coords['y'], grad_outputs=torch.ones_like(dT_dy), create_graph=True)[0]
+        d2T_dz2 = grad(dT_dz, coords['z'], grad_outputs=torch.ones_like(dT_dz), create_graph=True)[0]
         
         return T, dT_dt, dT_dx, dT_dy, dT_dz, d2T_dx2, d2T_dy2, d2T_dz2
     
@@ -531,7 +551,7 @@ def main():
         # Train the model (paper epochs)
         print("Starting training...")
         history = train_pinn(model, physics, X_pde, X_ic, X_bc,
-                            device, epochs=5000, lbfgs_epochs=1000)
+                            device, epochs=2000, lbfgs_epochs=1000)
         
         # Save the trained model
         checkpoint = {
