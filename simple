@@ -311,7 +311,7 @@ def train_pinn(model, physics, X_pde, X_ic, X_bc, device,
     x_bc, y_bc, z_bc, t_bc = X_bc[:,0], X_bc[:,1], X_bc[:,2], X_bc[:,3]
     
     # Loss weights (paper values)
-    loss_weights = {'pde': 5.0, 'ic': 1.0, 'bc': 10.0}
+    loss_weights = {'pde': 7.0, 'ic': 1.0, 'bc': 10.0}
     
     # Adam optimizer first
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
@@ -546,12 +546,12 @@ def main():
         # Generate training data with proper device handling
         print("Generating training data...")
         X_pde, X_ic, X_bc = generate_training_points(
-            params, n_pde=5000, n_ic=7000, n_bc=3000, device=device)
+            params, n_pde=20000, n_ic=30000, n_bc=10000, device=device)
         
         # Train the model (paper epochs)
         print("Starting training...")
         history = train_pinn(model, physics, X_pde, X_ic, X_bc,
-                            device, epochs=2000, lbfgs_epochs=1000)
+                            device, epochs=10000, lbfgs_epochs=16000)
         
         # Save the trained model
         checkpoint = {
