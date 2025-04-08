@@ -100,16 +100,24 @@ class LMDPhysics:
         self.T_ref = 3000.0  # Reference temperature for scaling
 
     def thermal_conductivity(self, T):
-        """Temperature-dependent thermal conductivity (Table 2)"""
-        k_low = 2.0e-5 * T**2 - 0.044 * T + 49.94  # T < 1733.15 K
-        k_high = torch.full_like(T, 31.9)           # T >= 1733.15 K
-        return torch.where(T < 1733.15, k_low, k_high)
+        """Temperature-dependent thermal conductivity from the paper's Table
+        Units: W/(m·K)
+        """
+        # For T < 1773.15 K
+        k_low = 2.0e-5 * T**2 - 0.0444 * T + 49.94
+        
+        # For T ≥ 1773.15 K
+        k_high = 1.04e-4 * T**2 - 0.3426 * T + 314.2
+        
+        # Combined piecewise function
+        return torch.where(T < 1773.15, k_low, k_high)
 
     def specific_heat(self, T):
         """Temperature-dependent specific heat (Table 2)"""
         cp_low = 1.04e-4 * T**2 - 0.3426 * T + 314.2  # T < 1373.15 K
         cp_high = torch.full_like(T, 700.0)           # T >= 1373.15 K
         return torch.where(T < 1373.15, cp_low, cp_high)
+
 
     def laser_heat_source(self, x, y, z, t):
         """Gaussian laser heat source (Eq. 4)"""
