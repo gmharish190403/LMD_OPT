@@ -97,19 +97,27 @@ class LMDPhysics:
         self.Lx, self.Ly, self.Lz = params['Lx'], params['Ly'], params['Lz']
         self.t1, self.t2 = params['t1'], params['t2']
         self.Q_max = 5.0e11  # Max laser power density for normalization
-        self.T_ref = 3500.0  # Reference temperature for scaling
+        self.T_ref = 3000.0  # Reference temperature for scaling
 
     def thermal_conductivity(self, T):
-        """Temperature-dependent thermal conductivity (Updated from table)"""
-        k_low = 2.0e-5 * T**2 - 0.0444 * T + 49.94  # T < 1773.15 K
-        k_high = 1.04e-4 * T**2 - 0.3426 * T + 314.2  # T >= 1773.15 K
+        """Temperature-dependent thermal conductivity from the paper's Table
+        Units: W/(m·K)
+        """
+        # For T < 1773.15 K
+        k_low = 2.0e-5 * T**2 - 0.0444 * T + 49.94
+        
+        # For T ≥ 1773.15 K
+        k_high = 1.04e-4 * T**2 - 0.3426 * T + 314.2
+        
+        # Combined piecewise function
         return torch.where(T < 1773.15, k_low, k_high)
 
     def specific_heat(self, T):
-        """Specific heat (Corrected to match paper values in Table 2)"""
-        # Correct formula from the paper
-        cp = -53.704 * T**2 - 3.267e5 * T + 4e8
-        return cp
+        """Temperature-dependent specific heat (Table 2)"""
+        cp_low = 1.04e-4 * T**2 - 0.3426 * T + 314.2  # T < 1373.15 K
+        cp_high = torch.full_like(T, 700.0)           # T >= 1373.15 K
+        return torch.where(T < 1373.15, cp_low, cp_high)
+
 
     def laser_heat_source(self, x, y, z, t):
         """Gaussian laser heat source (Eq. 4)"""
@@ -181,7 +189,7 @@ class LMDPhysics:
         return bc_residual / self.Q_max
 
 # Training Point Generation
-def generate_training_points(params, n_pde=2000, n_ic=1000, n_bc=3000, device='cpu', stage='deposition'):
+def generate_training_points(params, n_pde=3000, n_ic=4000, n_bc=2000, device='cpu', stage='deposition'):
     """Generate training points with focused sampling"""
     Lx, Ly, Lz = params['Lx'], params['Ly'], params['Lz']
     t1, t2 = params['t1'], params['t2']
@@ -258,7 +266,7 @@ def generate_training_points(params, n_pde=2000, n_ic=1000, n_bc=3000, device='c
     return X_pde, X_bc
 
 # Training Function
-def train_pinn(model, physics, X_pde, X_ic, X_bc, device, epochs=1000, lbfgs_epochs=1600, stage='deposition'):
+def train_pinn(model, physics, X_pde, X_ic, X_bc, device, epochs=3000, lbfgs_epochs=1600, stage='deposition'):
     """Two-phase training (Adam + L-BFGS)"""
     x_pde, y_pde, z_pde, t_pde = X_pde[:, 0], X_pde[:, 1], X_pde[:, 2], X_pde[:, 3]
     if stage == 'deposition':
