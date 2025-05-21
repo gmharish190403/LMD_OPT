@@ -1,0 +1,932 @@
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
+import torch # Important to set before torch or numpy/scipy are heavily used
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.colors import Normalize
+import time
+import os
+from scipy.interpolate import griddata
+
+# --- Configuration ---
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
+
+# --- Simulation & Material Parameters (Fixed for Forward Problems) ---
+P_LASER = 500.0
+R_BEAM = 1.5e-3
+V_SCAN = 10.0e-3
+ETA_LASER_ABSORPTIVITY = 0.4
+RHO_DENSITY = 8000.0
+CP_HEAT_CAPACITY = 500.0
+K_THERMAL_CONDUCTIVITY = 10.0
+H_CONVECTION_COEFF = 20.0
+EPS_EMISSIVITY = 0.3
+SIGMA_SB_CONST = 5.67e-8
+T_AMBIENT = 298.0
+
+X_MIN, X_MAX = 0.0, 40.0e-3
+Y_MIN, Y_MAX = 0.0, 10.0e-3
+Z_MIN, Z_MAX = 0.0, 6.0e-3
+T_MIN_SIM, T_MAX_SIM = 0.0, 3.0
+
+DATA_FILE_PATH = "C:/Users/91948/.spyder-py3/pinn_V1/simulation_data.npy"
+
+def load_and_preprocess_data(filepath, scale_coords_to_m=True, expected_physical_peak_temp=3300.0):
+    """
+    Loads and preprocesses data from an .npy file.
+    Args:
+        filepath (str): Path to the .npy file.
+        scale_coords_to_m (bool): If True, assumes x, y, z in the file are in mm
+                                   and scales them to meters.
+        expected_physical_peak_temp (float): An estimate of the maximum physical
+                                             temperature expected in the process. Used for
+                                             robust temperature normalization.
+    Returns:
+        tuple: (coords_norm, Tn_data, norm_params, raw_data)
+    """
+    try:
+        raw_data = np.load(filepath)
+        print(f"Raw data shape: {raw_data.shape}")
+        if raw_data.shape[1] != 5:
+            raise ValueError(f"Expected 5 columns (x,y,z,t,T), got {raw_data.shape[1]}")
+    except FileNotFoundError:
+        print(f"Error: Data file not found at {filepath}. Using dummy data.")
+        num_dummy_points = 10000
+        raw_data = np.random.rand(num_dummy_points, 5)
+        raw_data[:, 0] = raw_data[:, 0] * (X_MAX - X_MIN) + X_MIN 
+        raw_data[:, 1] = raw_data[:, 1] * (Y_MAX - Y_MIN) + Y_MIN
+        raw_data[:, 2] = raw_data[:, 2] * (Z_MAX - Z_MIN) + Z_MIN
+        raw_data[:, 3] = raw_data[:, 3] * (T_MAX_SIM - T_MIN_SIM) + T_MIN_SIM
+        raw_data[:, 4] = raw_data[:, 4] * (expected_physical_peak_temp - T_AMBIENT) + T_AMBIENT
+    except Exception as e:
+        print(f"An error occurred loading data: {e}. Using dummy data.")
+        num_dummy_points = 10000
+        raw_data = np.random.rand(num_dummy_points, 5)
+        raw_data[:, 0] = raw_data[:, 0] * (X_MAX - X_MIN) + X_MIN
+        raw_data[:, 1] = raw_data[:, 1] * (Y_MAX - Y_MIN) + Y_MIN
+        raw_data[:, 2] = raw_data[:, 2] * (Z_MAX - Z_MIN) + Z_MIN
+        raw_data[:, 3] = raw_data[:, 3] * (T_MAX_SIM - T_MIN_SIM) + T_MIN_SIM
+        raw_data[:, 4] = raw_data[:, 4] * (expected_physical_peak_temp - T_AMBIENT) + T_AMBIENT
+
+    x_data_orig_units = raw_data[:, 0].copy() 
+    y_data_orig_units = raw_data[:, 1].copy()
+    z_data_orig_units = raw_data[:, 2].copy()
+    t_data = raw_data[:, 3].copy() # Assuming time is already in seconds
+    T_data = raw_data[:, 4].copy()
+
+    # --- Unit Scaling for Coordinates ---
+    if scale_coords_to_m:
+        print("INFO: Scaling x, y, z coordinates from assumed mm to meters (dividing by 1000).")
+        x_data_m = x_data_orig_units / 1000.0
+        y_data_m = y_data_orig_units / 1000.0
+        z_data_m = z_data_orig_units / 1000.0
+    else:
+        print("INFO: Assuming x, y, z coordinates in the file are already in meters.")
+        x_data_m = x_data_orig_units
+        y_data_m = y_data_orig_units
+        z_data_m = z_data_orig_units
+    
+    # Debug print for coordinate ranges AFTER potential scaling
+    print(f"DEBUG LOAD: x_data_m min/max: {np.min(x_data_m):.4e}/{np.max(x_data_m):.4e} (Expected domain: {X_MIN:.4e}/{X_MAX:.4e})")
+    print(f"DEBUG LOAD: y_data_m min/max: {np.min(y_data_m):.4e}/{np.max(y_data_m):.4e} (Expected domain: {Y_MIN:.4e}/{Y_MAX:.4e})")
+    print(f"DEBUG LOAD: z_data_m min/max: {np.min(z_data_m):.4e}/{np.max(z_data_m):.4e} (Expected domain: {Z_MIN:.4e}/{Z_MAX:.4e})")
+    print(f"DEBUG LOAD: t_data min/max: {np.min(t_data):.2f}/{np.max(t_data):.2f} (Expected domain: {T_MIN_SIM:.2f}/{T_MAX_SIM:.2f})")
+
+
+    # --- Temperature Normalization Parameters ---
+    T_data_min_for_norm = T_AMBIENT
+    T_data_max_from_file = np.max(T_data) if T_data.size > 0 else (T_AMBIENT + 2000.0)
+    T_data_max_for_norm = max(T_data_max_from_file, expected_physical_peak_temp)
+    if T_data_max_for_norm <= T_data_min_for_norm:
+        T_data_max_for_norm = T_data_min_for_norm + 1000.0
+    print(f"INFO: For Temp Normalization - Min: {T_data_min_for_norm:.2f} K, Max: {T_data_max_for_norm:.2f} K")
+
+    # --- Normalization Functions (use x_data_m, y_data_m, z_data_m) ---
+    def normalize_coords(x, y, z, t):
+        x_range = X_MAX - X_MIN; y_range = Y_MAX - Y_MIN; z_range = Z_MAX - Z_MIN; t_range = T_MAX_SIM - T_MIN_SIM
+        xn = 2.0 * (x - X_MIN) / x_range - 1.0 if x_range > 1e-9 else np.zeros_like(x)
+        yn = 2.0 * (y - Y_MIN) / y_range - 1.0 if y_range > 1e-9 else np.zeros_like(y)
+        zn = 2.0 * (z - Z_MIN) / z_range - 1.0 if z_range > 1e-9 else np.zeros_like(z)
+        tn = 2.0 * (t - T_MIN_SIM) / t_range - 1.0 if t_range > 1e-9 else np.zeros_like(t)
+        return xn, yn, zn, tn
+
+    def denormalize_coords(xn, yn, zn, tn):
+        x_range = X_MAX - X_MIN; y_range = Y_MAX - Y_MIN; z_range = Z_MAX - Z_MIN; t_range = T_MAX_SIM - T_MIN_SIM
+        x = (xn + 1.0) / 2.0 * x_range + X_MIN
+        y = (yn + 1.0) / 2.0 * y_range + Y_MIN
+        z = (zn + 1.0) / 2.0 * z_range + Z_MIN
+        t = (tn + 1.0) / 2.0 * t_range + T_MIN_SIM
+        return x, y, z, t
+
+    def normalize_T(T_val):
+        range_T_norm = T_data_max_for_norm - T_data_min_for_norm
+        T_clipped = np.clip(T_val, T_data_min_for_norm, T_data_max_for_norm)
+        return (T_clipped - T_data_min_for_norm) / range_T_norm if range_T_norm > 1e-9 else np.zeros_like(T_val)
+
+    def denormalize_T(Tn_val):
+        range_T_norm = T_data_max_for_norm - T_data_min_for_norm
+        return Tn_val * range_T_norm + T_data_min_for_norm
+
+    xn_data_norm, yn_data_norm, zn_data_norm, tn_data_norm = normalize_coords(x_data_m, y_data_m, z_data_m, t_data)
+    Tn_data_norm = normalize_T(T_data)
+    
+    coords_norm_tuple = (xn_data_norm, yn_data_norm, zn_data_norm, tn_data_norm)
+    norm_params_dict = {
+        'normalize_coords': normalize_coords, 'denormalize_coords': denormalize_coords,
+        'normalize_T': normalize_T, 'denormalize_T': denormalize_T,
+        'T_min_norm_val': T_data_min_for_norm, 'T_max_norm_val': T_data_max_for_norm
+    }
+    if Tn_data_norm.size > 0:
+        print(f"INFO: Normalized Temperature (Tn_data) stats - min: {np.min(Tn_data_norm):.4f}, max: {np.max(Tn_data_norm):.4f}, mean: {np.mean(Tn_data_norm):.4f}")
+
+    # Return raw_data with original units for GT plotting, but use scaled coords for PINN training data
+    # The xn_data_all, yn_data_all etc. in main script will be from coords_norm_tuple (normalized from meters)
+    # The raw_data_all will have original file units, which plotting function needs to handle if they are mm.
+    # For simplicity, the plotting function will assume ground_truth_data (raw_data_all) has coords in METERS.
+    # So, we construct a new raw_data_for_plotting that has x,y,z in meters.
+    raw_data_for_plotting = np.stack((x_data_m, y_data_m, z_data_m, t_data, T_data), axis=-1)
+
+    return coords_norm_tuple, Tn_data_norm, norm_params_dict, raw_data_for_plotting
+
+class PINN(nn.Module):
+    def __init__(self, layers):
+        super(PINN, self).__init__()
+        self.layers_list = nn.ModuleList()
+        for i in range(len(layers) - 1):
+            self.layers_list.append(nn.Linear(layers[i], layers[i+1]))
+            if i < len(layers) - 2:
+                self.layers_list.append(nn.Tanh())
+
+        self.rho_fixed = RHO_DENSITY
+        self.cp_fixed = CP_HEAT_CAPACITY
+        self.k_fixed = K_THERMAL_CONDUCTIVITY
+        self.eta_fixed = ETA_LASER_ABSORPTIVITY
+        self.P_laser_val = P_LASER
+        self.r_beam_val = R_BEAM
+        self.v_scan_val = V_SCAN
+        self.h_conv_val = H_CONVECTION_COEFF
+        self.eps_em_val = EPS_EMISSIVITY
+        self.sigma_sb_val = SIGMA_SB_CONST
+        self.T_ambient_val = T_AMBIENT
+
+        self.alpha_char = self.k_fixed / (self.rho_fixed * self.cp_fixed) if (self.rho_fixed * self.cp_fixed) > 1e-9 else 1.0
+        self.q_laser_char_peak_absorbed = (2 * self.eta_fixed * self.P_laser_val / (np.pi * self.r_beam_val**2))
+        if self.q_laser_char_peak_absorbed < 1e-9: self.q_laser_char_peak_absorbed = 1.0
+        print(f"DEBUG PINN INIT: P_laser={self.P_laser_val:.1f}, R_beam={self.r_beam_val:.2e}, Eta={self.eta_fixed:.2f} => q_laser_char_peak_absorbed={self.q_laser_char_peak_absorbed:.2e} W/m^2")
+
+    def forward(self, x, y, z, t):
+        inputs = torch.cat([x, y, z, t], dim=1)
+        for layer_item in self.layers_list:
+            inputs = layer_item(inputs)
+        return torch.sigmoid(inputs)
+
+    def laser_source(self, x_orig, y_orig, t_orig):
+        x_laser = X_MIN + self.v_scan_val * t_orig
+        y_laser = Y_MIN + (Y_MAX - Y_MIN) / 2.0
+        d_sq = (x_orig - x_laser)**2 + (y_orig - y_laser)**2
+        q_laser_absorbed = self.q_laser_char_peak_absorbed * torch.exp(-2 * d_sq / self.r_beam_val**2)
+        return q_laser_absorbed
+
+    def pde_loss(self, x_c, y_c, z_c, t_c, norm_params):
+        x_c.requires_grad_(True); y_c.requires_grad_(True); z_c.requires_grad_(True); t_c.requires_grad_(True)
+        Tn_pred = self.forward(x_c, y_c, z_c, t_c)
+        T_range_norm = (norm_params['T_max_norm_val'] - norm_params['T_min_norm_val'])
+        x_range_half = (X_MAX - X_MIN) / 2.0; y_range_half = (Y_MAX - Y_MIN) / 2.0
+        z_range_half = (Z_MAX - Z_MIN) / 2.0; t_range_half = (T_MAX_SIM - T_MIN_SIM) / 2.0
+
+        dTn_dt = torch.autograd.grad(Tn_pred, t_c, grad_outputs=torch.ones_like(Tn_pred), create_graph=True, allow_unused=True)[0]
+        if dTn_dt is None: print("Warning: dTn_dt is None in PDE"); return torch.tensor(0.0, device=DEVICE)
+        dT_dt = dTn_dt * (T_range_norm / t_range_half) if t_range_half > 1e-9 else torch.zeros_like(dTn_dt)
+        
+        dTn_dx = torch.autograd.grad(Tn_pred, x_c, grad_outputs=torch.ones_like(Tn_pred), create_graph=True, allow_unused=True)[0]
+        dTn_dy = torch.autograd.grad(Tn_pred, y_c, grad_outputs=torch.ones_like(Tn_pred), create_graph=True, allow_unused=True)[0]
+        dTn_dz = torch.autograd.grad(Tn_pred, z_c, grad_outputs=torch.ones_like(Tn_pred), create_graph=True, allow_unused=True)[0]
+        if any(g is None for g in [dTn_dx, dTn_dy, dTn_dz]): print("Warning: Primary spatial grad is None in PDE"); return torch.tensor(0.0, device=DEVICE)
+
+        d2Tn_dx2 = torch.autograd.grad(dTn_dx, x_c, grad_outputs=torch.ones_like(dTn_dx), create_graph=True, allow_unused=True)[0]
+        d2Tn_dy2 = torch.autograd.grad(dTn_dy, y_c, grad_outputs=torch.ones_like(dTn_dy), create_graph=True, allow_unused=True)[0]
+        d2Tn_dz2 = torch.autograd.grad(dTn_dz, z_c, grad_outputs=torch.ones_like(dTn_dz), create_graph=True, allow_unused=True)[0]
+        if any(g is None for g in [d2Tn_dx2, d2Tn_dy2, d2Tn_dz2]): print("Warning: Secondary spatial grad is None in PDE"); return torch.tensor(0.0, device=DEVICE)
+
+        d2T_dx2 = d2Tn_dx2 * (T_range_norm / x_range_half**2); d2T_dy2 = d2Tn_dy2 * (T_range_norm / y_range_half**2)
+        d2T_dz2 = d2Tn_dz2 * (T_range_norm / z_range_half**2)
+        
+        laplacian_T_term = self.alpha_char * (d2T_dx2 + d2T_dy2 + d2T_dz2)
+        pde_residual = dT_dt - laplacian_T_term
+        loss_pde = torch.mean(pde_residual**2)
+        return loss_pde
+
+    def bc_loss(self, x_b, y_b, z_b, t_b, norm_params, current_epoch_for_debug=0, log_every_for_debug=100):
+        x_b.requires_grad_(True); y_b.requires_grad_(True); z_b.requires_grad_(True); t_b.requires_grad_(True)
+
+        Tn_bc_pred = self.forward(x_b, y_b, z_b, t_b) 
+        T_bc_pred_denorm = norm_params['denormalize_T'](Tn_bc_pred) 
+
+        x_b_orig, y_b_orig, z_b_orig, t_b_orig = norm_params['denormalize_coords'](
+            x_b.detach(), y_b.detach(), z_b.detach(), t_b.detach()
+        )
+
+        T_range_norm = (norm_params['T_max_norm_val'] - norm_params['T_min_norm_val'])
+        x_range_half = (X_MAX - X_MIN) / 2.0; y_range_half = (Y_MAX - Y_MIN) / 2.0
+        z_range_half = (Z_MAX - Z_MIN) / 2.0
+
+        dTn_dx_bc_full = torch.autograd.grad(Tn_bc_pred, x_b, grad_outputs=torch.ones_like(Tn_bc_pred), create_graph=True, allow_unused=True)[0]
+        dTn_dy_bc_full = torch.autograd.grad(Tn_bc_pred, y_b, grad_outputs=torch.ones_like(Tn_bc_pred), create_graph=True, allow_unused=True)[0]
+        dTn_dz_bc_full = torch.autograd.grad(Tn_bc_pred, z_b, grad_outputs=torch.ones_like(Tn_bc_pred), create_graph=True, allow_unused=True)[0]
+        
+        dTn_dx_bc_safe = dTn_dx_bc_full if dTn_dx_bc_full is not None else torch.zeros_like(Tn_bc_pred)
+        dTn_dy_bc_safe = dTn_dy_bc_full if dTn_dy_bc_full is not None else torch.zeros_like(Tn_bc_pred)
+        dTn_dz_bc_safe = dTn_dz_bc_full if dTn_dz_bc_full is not None else torch.zeros_like(Tn_bc_pred)
+
+        dT_dx_bc = dTn_dx_bc_safe * (T_range_norm / x_range_half)
+        dT_dy_bc = dTn_dy_bc_safe * (T_range_norm / y_range_half)
+        dT_dz_bc = dTn_dz_bc_safe * (T_range_norm / z_range_half)
+
+        loss_bc_total = torch.tensor(0.0, device=DEVICE)
+        k_current = self.k_fixed
+        
+        # --- Top surface (z_norm = 1.0, normal +z) ---
+        idx_top = (torch.abs(z_b.detach() - 1.0) < 1e-5)
+        if torch.any(idx_top):
+            T_pred_top_denorm = T_bc_pred_denorm[idx_top]
+            Tn_pred_top_norm  = Tn_bc_pred[idx_top] 
+            dT_dz_top_phys    = dT_dz_bc[idx_top]   
+
+            x_orig_top = x_b_orig[idx_top]
+            y_orig_top = y_b_orig[idx_top]
+            t_orig_top = t_b_orig[idx_top]
+
+            q_laser_top = self.laser_source(x_orig_top, y_orig_top, t_orig_top)
+            q_conv_top = self.h_conv_val * (T_pred_top_denorm - self.T_ambient_val)
+            q_rad_top = self.sigma_sb_val * self.eps_em_val * (T_pred_top_denorm**4 - self.T_ambient_val**4)
+
+            flux_normal_component = -k_current * dT_dz_top_phys 
+            total_surface_flux = q_laser_top + q_conv_top + q_rad_top
+            bc_residual_top_unscaled = flux_normal_component - total_surface_flux
+            
+            SCALER_FOR_TOP_BC = 5e5 
+            bc_residual_top_scaled = bc_residual_top_unscaled / SCALER_FOR_TOP_BC
+            loss_bc_total += torch.mean(bc_residual_top_scaled**2)
+
+            # --- LOW TEMPERATURE PENALTY under laser ---
+            MIN_TEMP_UNDER_LASER_K = 3100.0  # Target for the very peak
+            MIN_TEMP_UNDER_LASER_TARGET_NORM = norm_params['normalize_T'](MIN_TEMP_UNDER_LASER_K)
+            
+            active_laser_mask_on_top_pts = torch.zeros_like(q_laser_top, dtype=torch.bool) # Initialize
+            if q_laser_top.numel() > 0:
+                max_q_laser_in_batch = torch.max(q_laser_top.detach())
+                if max_q_laser_in_batch > 1e-3 : # Ensure max_q_laser is meaningful before using for threshold
+                    active_laser_mask_on_top_pts = q_laser_top.detach() > (0.75 * max_q_laser_in_batch) # Adaptive strict mask
+            
+            if torch.any(active_laser_mask_on_top_pts):
+                Tn_under_active_laser = Tn_pred_top_norm[active_laser_mask_on_top_pts]
+                if Tn_under_active_laser.numel() > 0: 
+                    low_temp_penalty_term = torch.mean(torch.relu(MIN_TEMP_UNDER_LASER_TARGET_NORM - Tn_under_active_laser)**2)
+                    WEIGHT_LOW_TEMP_PENALTY = 1000.0 # Keep strong
+                    loss_bc_total += WEIGHT_LOW_TEMP_PENALTY * low_temp_penalty_term
+                    if current_epoch_for_debug % log_every_for_debug == 0:
+                         print(f"    LowTempPenalty (raw, {Tn_under_active_laser.numel()} act pts): {low_temp_penalty_term.item():.2e}, TargetN: {MIN_TEMP_UNDER_LASER_TARGET_NORM:.2f} (TargetK: {MIN_TEMP_UNDER_LASER_K:.0f})")
+            # --- END LOW TEMPERATURE PENALTY ---
+
+            if current_epoch_for_debug % log_every_for_debug == 0:
+                print(f"  BC Top (Ep {current_epoch_for_debug}): NumPts={idx_top.sum().item()}, T_mean={T_pred_top_denorm.mean().item():.1f}K")
+                if q_laser_top.numel() > 0: # Add check for q_laser_top
+                     print(f"    DEBUG q_laser_top actual max for this batch: {q_laser_top.detach().max().item():.2e}")
+                print(f"    Fluxes (mean abs): Normal dTdz={torch.abs(flux_normal_component.detach()).mean().item():.2e}, Laser={torch.abs(q_laser_top.detach()).mean().item():.2e}, Conv={torch.abs(q_conv_top.detach()).mean().item():.2e}, Rad={torch.abs(q_rad_top.detach()).mean().item():.2e}")
+                print(f"    Residual_top_unscaled (mean abs): {torch.abs(bc_residual_top_unscaled.detach()).mean().item():.2e}")
+                print(f"    Residual_top_SCALED (by {SCALER_FOR_TOP_BC:.1e}) (mean abs): {torch.abs(bc_residual_top_scaled.detach()).mean().item():.2e}")
+
+        # --- Bottom surface (z_norm = -1.0, normal -z) ---
+        idx_bottom = (torch.abs(z_b.detach() - (-1.0)) < 1e-5)
+        if torch.any(idx_bottom):
+            Tn_pred_bottom_norm = Tn_bc_pred[idx_bottom]
+            target_Tn_bottom = norm_params['normalize_T'](torch.full_like(Tn_pred_bottom_norm, self.T_ambient_val))
+            bc_bottom_res_norm = Tn_pred_bottom_norm - target_Tn_bottom
+            WEIGHT_BOTTOM_DIRICHLET = 1000.0 
+            loss_bc_total += WEIGHT_BOTTOM_DIRICHLET * torch.mean(bc_bottom_res_norm**2)
+            if current_epoch_for_debug == 1: 
+                 print(f"  BC Bottom: NumPts={idx_bottom.sum().item()}, MeanResNormSq (after specific weight)={WEIGHT_BOTTOM_DIRICHLET * torch.mean(bc_bottom_res_norm**2).item():.2e}")
+
+        # --- Side Surfaces ---
+        SCALER_FOR_SIDES = 1e4 
+        # Front
+        idx_front = (torch.abs(y_b.detach() - 1.0) < 1e-5)
+        if torch.any(idx_front):
+            T_pred_side = T_bc_pred_denorm[idx_front]; dT_dy_side  = dT_dy_bc[idx_front] 
+            q_conv_side = self.h_conv_val*(T_pred_side - self.T_ambient_val); q_rad_side = self.sigma_sb_val*self.eps_em_val*(T_pred_side**4 - self.T_ambient_val**4)
+            flux_normal_component = -k_current*dT_dy_side; total_surface_flux = q_conv_side + q_rad_side
+            bc_res_unscaled = flux_normal_component - total_surface_flux; loss_bc_total += torch.mean((bc_res_unscaled / SCALER_FOR_SIDES)**2)
+            if current_epoch_for_debug == 1: print(f"  BC Front: NumPts={idx_front.sum().item()}, MeanSqScaledRes={torch.mean((bc_res_unscaled / SCALER_FOR_SIDES)**2).item():.2e}")
+        # Back
+        idx_back = (torch.abs(y_b.detach() - (-1.0)) < 1e-5)
+        if torch.any(idx_back):
+            T_pred_side = T_bc_pred_denorm[idx_back]; dT_dy_side  = dT_dy_bc[idx_back]
+            q_conv_side = self.h_conv_val*(T_pred_side - self.T_ambient_val); q_rad_side = self.sigma_sb_val*self.eps_em_val*(T_pred_side**4 - self.T_ambient_val**4)
+            flux_normal_component = k_current*dT_dy_side; total_surface_flux = q_conv_side + q_rad_side
+            bc_res_unscaled = flux_normal_component - total_surface_flux; loss_bc_total += torch.mean((bc_res_unscaled / SCALER_FOR_SIDES)**2)
+            if current_epoch_for_debug == 1: print(f"  BC Back: NumPts={idx_back.sum().item()}, MeanSqScaledRes={torch.mean((bc_res_unscaled / SCALER_FOR_SIDES)**2).item():.2e}")
+        # Right
+        idx_right = (torch.abs(x_b.detach() - 1.0) < 1e-5)
+        if torch.any(idx_right):
+            T_pred_side = T_bc_pred_denorm[idx_right]; dT_dx_side  = dT_dx_bc[idx_right]
+            q_conv_side = self.h_conv_val*(T_pred_side - self.T_ambient_val); q_rad_side = self.sigma_sb_val*self.eps_em_val*(T_pred_side**4 - self.T_ambient_val**4)
+            flux_normal_component = -k_current*dT_dx_side; total_surface_flux = q_conv_side + q_rad_side
+            bc_res_unscaled = flux_normal_component - total_surface_flux; loss_bc_total += torch.mean((bc_res_unscaled / SCALER_FOR_SIDES)**2)
+            if current_epoch_for_debug == 1: print(f"  BC Right: NumPts={idx_right.sum().item()}, MeanSqScaledRes={torch.mean((bc_res_unscaled / SCALER_FOR_SIDES)**2).item():.2e}")
+        # Left
+        idx_left = (torch.abs(x_b.detach() - (-1.0)) < 1e-5)
+        if torch.any(idx_left):
+            T_pred_side = T_bc_pred_denorm[idx_left]; dT_dx_side  = dT_dx_bc[idx_left]
+            q_conv_side = self.h_conv_val*(T_pred_side - self.T_ambient_val); q_rad_side = self.sigma_sb_val*self.eps_em_val*(T_pred_side**4 - self.T_ambient_val**4)
+            flux_normal_component = k_current*dT_dx_side; total_surface_flux = q_conv_side + q_rad_side
+            bc_res_unscaled = flux_normal_component - total_surface_flux; loss_bc_total += torch.mean((bc_res_unscaled / SCALER_FOR_SIDES)**2)
+            if current_epoch_for_debug == 1: print(f"  BC Left: NumPts={idx_left.sum().item()}, MeanSqScaledRes={torch.mean((bc_res_unscaled / SCALER_FOR_SIDES)**2).item():.2e}")
+               
+        return loss_bc_total
+
+    def ic_loss(self, x_ic, y_ic, z_ic, t_ic, norm_params):
+        Tn_ic_pred = self.forward(x_ic, y_ic, z_ic, t_ic)
+        target_Tn_ic = norm_params['normalize_T'](torch.full_like(Tn_ic_pred, self.T_ambient_val))
+        loss_ic = torch.mean((Tn_ic_pred - target_Tn_ic)**2)
+        return loss_ic
+
+    def data_loss(self, x_d, y_d, z_d, t_d, Tn_actual_d, norm_params_for_data_weighting):
+        Tn_data_pred = self.forward(x_d, y_d, z_d, t_d)
+        errors_sq = (Tn_data_pred - Tn_actual_d)**2
+        
+        point_weights = torch.ones_like(errors_sq, device=DEVICE)
+        hot_point_weight_factor = 500.0 # << VERY STRONG PULL FROM HOT DATA
+        
+        if Tn_actual_d.numel() > 0:
+            # Define "hot" based on normalized actual temperature
+            # Aim for points clearly in the melt pool / HAZ from simulation data
+            hot_threshold_K_data = 1800.0 # Data points hotter than 1800K get extra weight
+            hot_threshold_norm_data = norm_params_for_data_weighting['normalize_T'](hot_threshold_K_data)
+            
+            # Ensure hot_threshold_norm_data is a scalar for comparison
+            if not isinstance(hot_threshold_norm_data, float):
+                if hasattr(hot_threshold_norm_data, 'item'): # If it's a 0-dim tensor
+                    hot_threshold_norm_data = hot_threshold_norm_data.item()
+                elif isinstance(hot_threshold_norm_data, np.ndarray) and hot_threshold_norm_data.size == 1:
+                    hot_threshold_norm_data = hot_threshold_norm_data.item()
+                else: # Fallback if conversion is tricky, use a reasonable default normalized value
+                    print(f"Warning: hot_threshold_norm_data for data_loss is not scalar ({type(hot_threshold_norm_data)}), using default 0.5")
+                    hot_threshold_norm_data = 0.5 
+    
+            point_weights[Tn_actual_d > hot_threshold_norm_data] *= hot_point_weight_factor
+        
+        weighted_loss_d = torch.mean(point_weights * errors_sq)
+        return weighted_loss_d
+
+# --- Point Sampling --- (Keep as is)
+# ...
+def sample_collocation_points(N_c, norm_params, device):
+    xn_c = torch.rand(N_c, 1, device=device) * 2 - 1
+    yn_c = torch.rand(N_c, 1, device=device) * 2 - 1
+    zn_c = torch.rand(N_c, 1, device=device) * 2 - 1
+    tn_c = torch.rand(N_c, 1, device=device) * 2 - 1
+    return xn_c, yn_c, zn_c, tn_c
+
+def sample_boundary_points(N_b_top, N_b_others, norm_params, device):
+    coords = []
+    # Top (zn=1, normal +z)
+    xn_ = torch.rand(N_b_top, 1, device=device) * 2 - 1
+    yn_ = torch.rand(N_b_top, 1, device=device) * 2 - 1
+    zn_ = torch.ones_like(xn_) * 1.0
+    tn_ = torch.rand(N_b_top, 1, device=device) * 2 - 1
+    coords.append(torch.cat([xn_, yn_, zn_, tn_], dim=1))
+
+    # Bottom (zn=-1, normal -z)
+    xn_ = torch.rand(N_b_others, 1, device=device) * 2 - 1
+    yn_ = torch.rand(N_b_others, 1, device=device) * 2 - 1
+    zn_ = torch.ones_like(xn_) * -1.0
+    tn_ = torch.rand(N_b_others, 1, device=device) * 2 - 1
+    coords.append(torch.cat([xn_, yn_, zn_, tn_], dim=1))
+
+    # Front (yn=1, normal +y) - x and z vary
+    xn_ = torch.rand(N_b_others, 1, device=device) * 2 - 1 
+    zn_ = torch.rand(N_b_others, 1, device=device) * 2 - 1 
+    yn_ = torch.ones_like(xn_) * 1.0      # y is fixed at max
+    tn_ = torch.rand(N_b_others, 1, device=device) * 2 - 1
+    coords.append(torch.cat([xn_, yn_, zn_, tn_], dim=1))
+
+    # Back (yn=-1, normal -y) - x and z vary
+    xn_ = torch.rand(N_b_others, 1, device=device) * 2 - 1 
+    zn_ = torch.rand(N_b_others, 1, device=device) * 2 - 1 
+    yn_ = torch.ones_like(xn_) * -1.0     # y is fixed at min
+    tn_ = torch.rand(N_b_others, 1, device=device) * 2 - 1
+    coords.append(torch.cat([xn_, yn_, zn_, tn_], dim=1))
+    
+    # Right (xn=1, normal +x) - y and z vary
+    yn_ = torch.rand(N_b_others, 1, device=device) * 2 - 1 
+    zn_ = torch.rand(N_b_others, 1, device=device) * 2 - 1 
+    xn_ = torch.ones_like(yn_) * 1.0      # x is fixed at max
+    tn_ = torch.rand(N_b_others, 1, device=device) * 2 - 1
+    coords.append(torch.cat([xn_, yn_, zn_, tn_], dim=1))
+
+    # Left (xn=-1, normal -x) - y and z vary
+    yn_ = torch.rand(N_b_others, 1, device=device) * 2 - 1 
+    zn_ = torch.rand(N_b_others, 1, device=device) * 2 - 1 
+    xn_ = torch.ones_like(yn_) * -1.0     # x is fixed at min
+    tn_ = torch.rand(N_b_others, 1, device=device) * 2 - 1
+    coords.append(torch.cat([xn_, yn_, zn_, tn_], dim=1))
+    
+    all_b_coords = torch.cat(coords, dim=0)
+    print(f"DEBUG sample_boundary_points: Total boundary points sampled: {all_b_coords.shape[0]}")
+    return all_b_coords[:,0:1], all_b_coords[:,1:2], all_b_coords[:,2:3], all_b_coords[:,3:4]
+
+def sample_initial_points(N_ic, norm_params, device): # ...
+    xn_ic = torch.rand(N_ic, 1, device=device) * 2 - 1
+    yn_ic = torch.rand(N_ic, 1, device=device) * 2 - 1
+    zn_ic = torch.rand(N_ic, 1, device=device) * 2 - 1
+    tn_ic = torch.ones_like(xn_ic) * (-1.0) # Normalized t_min
+    return xn_ic, yn_ic, zn_ic, tn_ic
+
+# --- Training --- (Keep as is, it already passes epoch and log_every)
+# ...
+def train_pinn(model, optimizer, epochs,
+               xn_c, yn_c, zn_c, tn_c,
+               xn_b, yn_b, zn_b, tn_b,
+               xn_ic, yn_ic, zn_ic, tn_ic,
+               xn_d, yn_d, zn_d, tn_d, Tn_actual_d,
+               norm_params,
+               weights = {'pde': 1.0, 'bc': 1.0, 'ic': 1.0, 'data': 1.0},
+               log_every=100, scheduler=None):
+    
+    history = {'loss': [], 'loss_pde': [], 'loss_bc': [], 'loss_ic': [], 'loss_data': []}
+    start_time_train = time.time() 
+
+    for epoch in range(epochs):
+        epoch_start_time = time.time() 
+        model.train()
+        optimizer.zero_grad()
+
+        loss_pde = model.pde_loss(xn_c, yn_c, zn_c, tn_c, norm_params)
+        loss_bc = model.bc_loss(xn_b, yn_b, zn_b, tn_b, norm_params, 
+                                current_epoch_for_debug=epoch + 1, 
+                                log_every_for_debug=log_every)
+        loss_ic = model.ic_loss(xn_ic, yn_ic, zn_ic, tn_ic, norm_params)
+        
+        total_loss = weights['pde'] * loss_pde + \
+                     weights['bc'] * loss_bc + \
+                     weights['ic'] * loss_ic
+
+        history['loss_pde'].append(loss_pde.item())
+        history['loss_bc'].append(loss_bc.item()) 
+        history['loss_ic'].append(loss_ic.item())
+
+        loss_data_val = torch.tensor(0.0, device=DEVICE) # Default if no data
+        if xn_d is not None and Tn_actual_d is not None :
+            # Pass norm_params to data_loss if it needs it for weighting
+            loss_data_val = model.data_loss(xn_d, yn_d, zn_d, tn_d, Tn_actual_d, 
+                                            norm_params_for_data_weighting=norm_params) # <<< ADDED ARGUMENT HERE
+            total_loss += weights['data'] * loss_data_val
+            history['loss_data'].append(loss_data_val.item())
+        else:
+            history['loss_data'].append(0.0)
+
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Keep clipping
+        optimizer.step()
+        
+        if scheduler:
+            scheduler.step(total_loss.item())
+
+        history['loss'].append(total_loss.item())
+
+        if (epoch + 1) % log_every == 0:
+            elapsed_time_interval = time.time() - epoch_start_time 
+            current_lr = optimizer.param_groups[0]['lr']
+            # Log raw BC loss and weighted BC loss
+            raw_bc_loss_val = loss_bc.item() 
+            weighted_bc_loss_val = weights['bc'] * raw_bc_loss_val
+            log_msg = f"Epoch {epoch+1}/{epochs}, Loss: {total_loss.item():.4e}, LR: {current_lr:.1e}, " \
+                      f"PDE: {loss_pde.item():.2e}, BC_raw: {raw_bc_loss_val:.2e} (wBC: {weighted_bc_loss_val:.2e}), " \
+                      f"IC: {loss_ic.item():.2e}"
+            if xn_d is not None and Tn_actual_d is not None:
+                log_msg += f", Data: {loss_data_val.item():.2e}"
+            log_msg += f" (Interval Time: {elapsed_time_interval:.2f}s)"
+            print(log_msg)
+    
+    total_training_time = time.time() - start_time_train
+    print(f"Total training time: {total_training_time:.2f}s")
+    return history
+
+# --- Plotting and RMSE Functions --- (Keep as is from your last working version)
+# plot_loss_history, plot_temperature_comparison_detailed, calculate_rmse
+# ...
+def plot_loss_history(history, title="Loss History"):
+    plt.figure(figsize=(12, 8))
+    plt.semilogy(history['loss'], label=f"Total Loss (final: {history['loss'][-1]:.2e})", alpha=0.9)
+    if history['loss_pde']: plt.semilogy(history['loss_pde'], label=f"PDE Loss (final: {history['loss_pde'][-1]:.2e})", linestyle='--', alpha=0.7)
+    if history['loss_bc']: plt.semilogy(history['loss_bc'], label=f"BC_raw Loss (final: {history['loss_bc'][-1]:.2e})", linestyle='--', alpha=0.7)
+    if history['loss_ic']: plt.semilogy(history['loss_ic'], label=f"IC Loss (final: {history['loss_ic'][-1]:.2e})", linestyle='--', alpha=0.7)
+    if any(d > 1e-9 for d in history.get('loss_data', [])): 
+         plt.semilogy(history['loss_data'], label=f"Data Loss (final: {history['loss_data'][-1]:.2e})", linestyle=':', alpha=0.9)
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss (log scale)")
+    plt.title(title)
+    plt.legend()
+    plt.grid(True, which="both", ls="-", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+def plot_temperature_comparison_detailed(model, ground_truth_data_meters, norm_params, time_instances_s, title_suffix=""):
+    # ground_truth_data_meters is assumed to have x,y,z in METERS
+    global DEVICE 
+    global X_MIN, X_MAX, Y_MIN, Y_MAX, Z_MIN, Z_MAX, T_AMBIENT # Removed T_MAX_SIM, T_MIN_SIM as they are in norm_params
+
+    model.eval()
+    if ground_truth_data_meters is None or ground_truth_data_meters.size == 0:
+        print("No ground truth data provided for comparison plotting.")
+        # Still create a plot with just PINN if no GT
+        # return # Or decide to plot only PINN
+
+    x_gt_all_m, y_gt_all_m, z_gt_all_m, t_gt_all, T_gt_all = (None,)*5
+    has_gt_data = False
+    if ground_truth_data_meters is not None and ground_truth_data_meters.size > 0:
+        x_gt_all_m, y_gt_all_m, z_gt_all_m, t_gt_all, T_gt_all = ground_truth_data_meters[:,0], ground_truth_data_meters[:,1], ground_truth_data_meters[:,2], ground_truth_data_meters[:,3], ground_truth_data_meters[:,4]
+        has_gt_data = True
+
+    z_slice_for_top_view_orig_m = Z_MAX 
+    y_slice_for_cross_section_orig_m = Y_MIN + (Y_MAX - Y_MIN) / 2.0
+
+    num_times = len(time_instances_s)
+    fig, axes = plt.subplots(num_times * 2, 3, figsize=(18, 5.5 * num_times * 2), squeeze=False) # Adjusted figure height slightly
+    
+    num_grid_pts_xy = 50 # Increased grid points for better resolution
+    num_grid_pts_xz = 50 
+
+    x_pinn_grid_m = np.linspace(X_MIN, X_MAX, num_grid_pts_xy)
+    y_pinn_grid_m = np.linspace(Y_MIN, Y_MAX, num_grid_pts_xy)
+    X_pinn_grid_m, Y_pinn_grid_m = np.meshgrid(x_pinn_grid_m, y_pinn_grid_m)
+    
+    z_pinn_grid_m = np.linspace(Z_MIN, Z_MAX, num_grid_pts_xz)
+    X_pinn_cs_grid_m, Z_pinn_cs_grid_m = np.meshgrid(x_pinn_grid_m, z_pinn_grid_m)
+
+    # --- Calculate vmin_temp, vmax_temp for PINN plots based on PINN's own range ---
+    all_pinn_temps_for_norm = []
+    pinn_predictions_cache = {} # Cache predictions to avoid recomputing
+
+    for t_val_s_loop in time_instances_s:
+        # PINN Top View pre-calc
+        key_tv = (t_val_s_loop, 'tv')
+        if key_tv not in pinn_predictions_cache:
+            xn_tv_norm_loop, yn_tv_norm_loop, zn_tv_norm_loop, tn_tv_norm_loop = norm_params['normalize_coords'](X_pinn_grid_m.ravel(), Y_pinn_grid_m.ravel(), np.full_like(X_pinn_grid_m.ravel(), z_slice_for_top_view_orig_m), np.full_like(X_pinn_grid_m.ravel(), t_val_s_loop))
+            with torch.no_grad(): T_pinn_tv_loop = norm_params['denormalize_T'](model(torch.tensor(xn_tv_norm_loop,dtype=torch.float32).reshape(-1,1).to(DEVICE),torch.tensor(yn_tv_norm_loop,dtype=torch.float32).reshape(-1,1).to(DEVICE),torch.tensor(zn_tv_norm_loop,dtype=torch.float32).reshape(-1,1).to(DEVICE),torch.tensor(tn_tv_norm_loop,dtype=torch.float32).reshape(-1,1).to(DEVICE)).cpu().numpy()).reshape(X_pinn_grid_m.shape)
+            pinn_predictions_cache[key_tv] = T_pinn_tv_loop
+        else:
+            T_pinn_tv_loop = pinn_predictions_cache[key_tv]
+        if T_pinn_tv_loop.size > 0: all_pinn_temps_for_norm.append(T_pinn_tv_loop.ravel())
+
+        # PINN Cross-Section pre-calc
+        key_cs = (t_val_s_loop, 'cs')
+        if key_cs not in pinn_predictions_cache:
+            xn_cs_norm_loop, yn_cs_norm_loop, zn_cs_norm_loop, tn_cs_norm_loop = norm_params['normalize_coords'](X_pinn_cs_grid_m.ravel(), np.full_like(X_pinn_cs_grid_m.ravel(), y_slice_for_cross_section_orig_m), Z_pinn_cs_grid_m.ravel(), np.full_like(X_pinn_cs_grid_m.ravel(), t_val_s_loop))
+            with torch.no_grad(): T_pinn_cs_loop = norm_params['denormalize_T'](model(torch.tensor(xn_cs_norm_loop,dtype=torch.float32).reshape(-1,1).to(DEVICE),torch.tensor(yn_cs_norm_loop,dtype=torch.float32).reshape(-1,1).to(DEVICE),torch.tensor(zn_cs_norm_loop,dtype=torch.float32).reshape(-1,1).to(DEVICE),torch.tensor(tn_cs_norm_loop,dtype=torch.float32).reshape(-1,1).to(DEVICE)).cpu().numpy()).reshape(X_pinn_cs_grid_m.shape)
+            pinn_predictions_cache[key_cs] = T_pinn_cs_loop
+        else:
+            T_pinn_cs_loop = pinn_predictions_cache[key_cs]
+        if T_pinn_cs_loop.size > 0: all_pinn_temps_for_norm.append(T_pinn_cs_loop.ravel())
+
+    if not all_pinn_temps_for_norm or not any(a.size > 0 for a in all_pinn_temps_for_norm if a is not None):
+        vmin_pinn, vmax_pinn = T_AMBIENT, T_AMBIENT + 1000 # Fallback
+    else:
+        valid_pinn_temps = np.concatenate([a for a in all_pinn_temps_for_norm if a is not None and a.size > 0])
+        if valid_pinn_temps.size == 0: vmin_pinn, vmax_pinn = T_AMBIENT, T_AMBIENT + 1000
+        else: vmin_pinn = max(T_AMBIENT, np.min(valid_pinn_temps)); vmax_pinn = np.max(valid_pinn_temps)
+    # Ensure vmin is not equal to vmax to avoid plotting issues
+    if abs(vmax_pinn - vmin_pinn) < 1e-3: vmax_pinn = vmin_pinn + 1.0 
+    color_norm_pinn = Normalize(vmin=vmin_pinn, vmax=vmax_pinn)
+    print(f"DEBUG PLOTTING: PINN color norm range: {vmin_pinn:.1f} K to {vmax_pinn:.1f} K")
+
+    # --- Calculate vmin_temp, vmax_temp for GT plots ---
+    if has_gt_data and T_gt_all.size > 0:
+        vmin_gt = max(T_AMBIENT, np.min(T_gt_all)); vmax_gt = np.max(T_gt_all)
+        if abs(vmax_gt - vmin_gt) < 1e-3: vmax_gt = vmin_gt + 1.0
+        color_norm_gt = Normalize(vmin=vmin_gt, vmax=vmax_gt)
+        print(f"DEBUG PLOTTING: GT color norm range: {vmin_gt:.1f} K to {vmax_gt:.1f} K")
+    else: # Fallback if no GT data
+        vmin_gt, vmax_gt = T_AMBIENT, T_AMBIENT + 2000 
+        color_norm_gt = Normalize(vmin=vmin_gt, vmax=vmax_gt)
+        print(f"DEBUG PLOTTING: No GT data, GT color norm fallback: {vmin_gt:.1f} K to {vmax_gt:.1f} K")
+
+    # --- Color norm for Difference plots ---
+    # Let's make the diff range dynamic based on observed differences, or keep it fixed if preferred.
+    # For now, using a fixed range as before.
+    diff_abs_max = 360.0 # Example, can be adjusted
+    if has_gt_data: # Only calculate if GT exists for comparison
+        example_pinn_temps_for_diff = pinn_predictions_cache.get((time_instances_s[0], 'tv'))
+        if example_pinn_temps_for_diff is not None:
+            mask_gt_tv_time_ex = np.abs(t_gt_all - time_instances_s[0]) < 1e-5
+            mask_gt_tv_z_ex    = np.abs(z_gt_all_m - z_slice_for_top_view_orig_m) < 0.20e-3
+            idx_gt_tv_ex = mask_gt_tv_time_ex & mask_gt_tv_z_ex
+            if np.any(idx_gt_tv_ex):
+                x_gt_slice_tv_m_ex = x_gt_all_m[idx_gt_tv_ex]; y_gt_slice_tv_m_ex = y_gt_all_m[idx_gt_tv_ex]; T_gt_slice_tv_ex = T_gt_all[idx_gt_tv_ex]
+                unique_x_tv_m_ex = np.unique(x_gt_slice_tv_m_ex); unique_y_tv_m_ex = np.unique(y_gt_slice_tv_m_ex)
+                if len(unique_x_tv_m_ex) > 1 and len(unique_y_tv_m_ex) > 1:
+                    X_gt_tv_mesh_m_ex, Y_gt_tv_mesh_m_ex = np.meshgrid(unique_x_tv_m_ex, unique_y_tv_m_ex)
+                    T_gt_tv_grid_ex = griddata((x_gt_slice_tv_m_ex, y_gt_slice_tv_m_ex), T_gt_slice_tv_ex, (X_gt_tv_mesh_m_ex, Y_gt_tv_mesh_m_ex), method='nearest')
+                    T_pinn_on_gt_mesh_tv_ex = griddata((X_pinn_grid_m.ravel(),Y_pinn_grid_m.ravel()), example_pinn_temps_for_diff.ravel(), (X_gt_tv_mesh_m_ex.ravel(),Y_gt_tv_mesh_m_ex.ravel()), method='linear').reshape(X_gt_tv_mesh_m_ex.shape)
+                    valid_diff_mask_tv_ex = ~np.isnan(T_gt_tv_grid_ex) & ~np.isnan(T_pinn_on_gt_mesh_tv_ex)
+                    if np.any(valid_diff_mask_tv_ex):
+                        T_diff_tv_ex_vals = T_pinn_on_gt_mesh_tv_ex[valid_diff_mask_tv_ex] - T_gt_tv_grid_ex[valid_diff_mask_tv_ex]
+                        # diff_abs_max = max(100.0, np.percentile(np.abs(T_diff_tv_ex_vals), 98)) # e.g., 98th percentile of abs diff
+                        # Let's keep it fixed for now for consistency unless it's too off
+                        pass
+
+
+    diff_color_norm = Normalize(vmin=-diff_abs_max, vmax=diff_abs_max)
+    print(f"DEBUG PLOTTING: Diff color norm range: +/- {diff_abs_max:.1f} K")
+
+
+    for i, t_val_s in enumerate(time_instances_s):
+        plot_row_offset = i * 2 
+        
+        # --- PINN Plots (using color_norm_pinn) ---
+        T_pinn_tv_current = pinn_predictions_cache[(t_val_s, 'tv')]
+        ax_pinn_tv = axes[plot_row_offset, 0]
+        cont_pinn_tv = ax_pinn_tv.contourf(X_pinn_grid_m*1000, Y_pinn_grid_m*1000, T_pinn_tv_current, levels=50, cmap='jet', norm=color_norm_pinn)
+        ax_pinn_tv.set_title(f"PINN Top (z={z_slice_for_top_view_orig_m*1000:.1f}mm, t={t_val_s:.1f}s)")
+        ax_pinn_tv.set_xlabel("X (mm)"); ax_pinn_tv.set_ylabel("Y (mm)"); ax_pinn_tv.set_aspect('equal')
+
+        T_pinn_cs_current = pinn_predictions_cache[(t_val_s, 'cs')]
+        ax_pinn_cs = axes[plot_row_offset + 1, 0]
+        cont_pinn_cs = ax_pinn_cs.contourf(X_pinn_cs_grid_m*1000, Z_pinn_cs_grid_m*1000, T_pinn_cs_current, levels=50, cmap='jet', norm=color_norm_pinn)
+        ax_pinn_cs.set_title(f"PINN XZ (y={y_slice_for_cross_section_orig_m*1000:.1f}mm, t={t_val_s:.1f}s)")
+        ax_pinn_cs.set_xlabel("X (mm)"); ax_pinn_cs.set_ylabel("Z (mm)"); ax_pinn_cs.set_aspect('auto')
+
+        # --- Ground Truth and Difference Plots (only if GT data exists) ---
+        if has_gt_data:
+            time_epsilon = 1e-5 
+            coord_epsilon = 0.20e-3 
+
+            # GT Top View
+            ax_gt_tv = axes[plot_row_offset, 1]
+            mask_gt_tv_time = np.abs(t_gt_all - t_val_s) < time_epsilon
+            mask_gt_tv_z    = np.abs(z_gt_all_m - z_slice_for_top_view_orig_m) < coord_epsilon
+            idx_gt_tv = mask_gt_tv_time & mask_gt_tv_z
+            
+            T_gt_tv_grid = None # Initialize
+            if np.any(idx_gt_tv):
+                x_gt_slice_tv_m = x_gt_all_m[idx_gt_tv]; y_gt_slice_tv_m = y_gt_all_m[idx_gt_tv]; T_gt_slice_tv = T_gt_all[idx_gt_tv]
+                unique_x_tv_m = np.unique(x_gt_slice_tv_m); unique_y_tv_m = np.unique(y_gt_slice_tv_m)
+                if len(unique_x_tv_m) > 1 and len(unique_y_tv_m) > 1:
+                    X_gt_tv_mesh_m, Y_gt_tv_mesh_m = np.meshgrid(unique_x_tv_m, unique_y_tv_m)
+                    T_gt_tv_grid = griddata((x_gt_slice_tv_m, y_gt_slice_tv_m), T_gt_slice_tv, (X_gt_tv_mesh_m, Y_gt_tv_mesh_m), method='nearest')
+                    ax_gt_tv.contourf(X_gt_tv_mesh_m*1000, Y_gt_tv_mesh_m*1000, T_gt_tv_grid, levels=50, cmap='jet', norm=color_norm_gt)
+                else: ax_gt_tv.text(0.5,0.5,f"GT Top not 2D\n(x:{len(unique_x_tv_m)},y:{len(unique_y_tv_m)})",ha='center',va='center',transform=ax_gt_tv.transAxes,fontsize=8)
+            else: ax_gt_tv.text(0.5,0.5,"No GT data for Top slice",ha='center',va='center',transform=ax_gt_tv.transAxes)
+            ax_gt_tv.set_title(f"GT Top (z~{z_slice_for_top_view_orig_m*1000:.1f}mm, t={t_val_s:.1f}s)")
+            ax_gt_tv.set_xlabel("X (mm)"); ax_gt_tv.set_ylabel("Y (mm)"); ax_gt_tv.set_aspect('equal')
+            ax_gt_tv.set_xlim(X_MIN*1000,X_MAX*1000); ax_gt_tv.set_ylim(Y_MIN*1000,Y_MAX*1000)
+
+            # Difference Top View
+            ax_diff_tv = axes[plot_row_offset, 2]
+            if T_gt_tv_grid is not None and not np.all(np.isnan(T_gt_tv_grid)): # Check if T_gt_tv_grid was populated
+                T_pinn_on_gt_mesh_tv = griddata((X_pinn_grid_m.ravel(),Y_pinn_grid_m.ravel()), T_pinn_tv_current.ravel(), (X_gt_tv_mesh_m.ravel(),Y_gt_tv_mesh_m.ravel()), method='linear').reshape(X_gt_tv_mesh_m.shape)
+                valid_diff_mask_tv = ~np.isnan(T_gt_tv_grid) & ~np.isnan(T_pinn_on_gt_mesh_tv)
+                if np.any(valid_diff_mask_tv):
+                    T_diff_tv = np.full_like(T_gt_tv_grid, np.nan); T_diff_tv[valid_diff_mask_tv] = T_pinn_on_gt_mesh_tv[valid_diff_mask_tv] - T_gt_tv_grid[valid_diff_mask_tv]
+                    ax_diff_tv.contourf(X_gt_tv_mesh_m*1000, Y_gt_tv_mesh_m*1000, T_diff_tv, levels=50, cmap='coolwarm', norm=diff_color_norm)
+                else: ax_diff_tv.text(0.5,0.5,"Diff calc failed",ha='center',va='center',transform=ax_diff_tv.transAxes)
+            else: ax_diff_tv.text(0.5,0.5,"No diff data",ha='center',va='center',transform=ax_diff_tv.transAxes)
+            ax_diff_tv.set_title(f"Diff Top (t={t_val_s:.1f}s)")
+            ax_diff_tv.set_xlabel("X (mm)"); ax_diff_tv.set_ylabel("Y (mm)"); ax_diff_tv.set_aspect('equal')
+            ax_diff_tv.set_xlim(X_MIN*1000,X_MAX*1000); ax_diff_tv.set_ylim(Y_MIN*1000,Y_MAX*1000)
+
+            # GT Cross-Section
+            ax_gt_cs = axes[plot_row_offset + 1, 1]
+            mask_gt_cs_time = np.abs(t_gt_all - t_val_s) < time_epsilon
+            mask_gt_cs_y    = np.abs(y_gt_all_m - y_slice_for_cross_section_orig_m) < coord_epsilon
+            idx_gt_cs = mask_gt_cs_time & mask_gt_cs_y
+            
+            T_gt_cs_grid = None # Initialize
+            if np.any(idx_gt_cs):
+                x_gt_slice_cs_m = x_gt_all_m[idx_gt_cs]; z_gt_slice_cs_m = z_gt_all_m[idx_gt_cs]; T_gt_slice_cs = T_gt_all[idx_gt_cs]
+                unique_x_cs_m = np.unique(x_gt_slice_cs_m); unique_z_cs_m = np.unique(z_gt_slice_cs_m)
+                if len(unique_x_cs_m) > 1 and len(unique_z_cs_m) > 1:
+                    X_gt_cs_mesh_m, Z_gt_cs_mesh_m = np.meshgrid(unique_x_cs_m, unique_z_cs_m)
+                    T_gt_cs_grid = griddata((x_gt_slice_cs_m, z_gt_slice_cs_m), T_gt_slice_cs, (X_gt_cs_mesh_m, Z_gt_cs_mesh_m), method='nearest')
+                    ax_gt_cs.contourf(X_gt_cs_mesh_m*1000, Z_gt_cs_mesh_m*1000, T_gt_cs_grid, levels=50, cmap='jet', norm=color_norm_gt)
+                else: ax_gt_cs.text(0.5,0.5,f"GT XZ not 2D\n(x:{len(unique_x_cs_m)},z:{len(unique_z_cs_m)})",ha='center',va='center',transform=ax_gt_cs.transAxes,fontsize=8)
+            else: ax_gt_cs.text(0.5,0.5,"No GT data for XZ slice",ha='center',va='center',transform=ax_gt_cs.transAxes)
+            ax_gt_cs.set_title(f"GT XZ (y~{y_slice_for_cross_section_orig_m*1000:.1f}mm, t={t_val_s:.1f}s)")
+            ax_gt_cs.set_xlabel("X (mm)"); ax_gt_cs.set_ylabel("Z (mm)"); ax_gt_cs.set_aspect('auto')
+            ax_gt_cs.set_xlim(X_MIN*1000,X_MAX*1000); ax_gt_cs.set_ylim(Z_MIN*1000,Z_MAX*1000)
+
+            # Difference Cross-Section
+            ax_diff_cs = axes[plot_row_offset + 1, 2]
+            if T_gt_cs_grid is not None and not np.all(np.isnan(T_gt_cs_grid)): # Check if T_gt_cs_grid was populated
+                T_pinn_on_gt_mesh_cs = griddata((X_pinn_cs_grid_m.ravel(),Z_pinn_cs_grid_m.ravel()), T_pinn_cs_current.ravel(), (X_gt_cs_mesh_m.ravel(),Z_gt_cs_mesh_m.ravel()), method='linear').reshape(X_gt_cs_mesh_m.shape)
+                valid_diff_mask_cs = ~np.isnan(T_gt_cs_grid) & ~np.isnan(T_pinn_on_gt_mesh_cs)
+                if np.any(valid_diff_mask_cs):
+                    T_diff_cs = np.full_like(T_gt_cs_grid, np.nan); T_diff_cs[valid_diff_mask_cs] = T_pinn_on_gt_mesh_cs[valid_diff_mask_cs] - T_gt_cs_grid[valid_diff_mask_cs]
+                    ax_diff_cs.contourf(X_gt_cs_mesh_m*1000, Z_gt_cs_mesh_m*1000, T_diff_cs, levels=50, cmap='coolwarm', norm=diff_color_norm)
+                else: ax_diff_cs.text(0.5,0.5,"Diff calc failed",ha='center',va='center',transform=ax_diff_cs.transAxes)
+            else: ax_diff_cs.text(0.5,0.5,"No diff data",ha='center',va='center',transform=ax_diff_cs.transAxes)
+            ax_diff_cs.set_title(f"Diff XZ (t={t_val_s:.1f}s)")
+            ax_diff_cs.set_xlabel("X (mm)"); ax_diff_cs.set_ylabel("Z (mm)"); ax_diff_cs.set_aspect('auto')
+            ax_diff_cs.set_xlim(X_MIN*1000,X_MAX*1000); ax_diff_cs.set_ylim(Z_MIN*1000,Z_MAX*1000)
+        else: # No GT data, fill GT and Diff columns with placeholder text
+            for col_idx in [1, 2]:
+                axes[plot_row_offset, col_idx].text(0.5,0.5,"No GT Data",ha='center',va='center',transform=axes[plot_row_offset, col_idx].transAxes)
+                axes[plot_row_offset, col_idx].set_xticks([]); axes[plot_row_offset, col_idx].set_yticks([])
+                axes[plot_row_offset + 1, col_idx].text(0.5,0.5,"No GT Data",ha='center',va='center',transform=axes[plot_row_offset+1, col_idx].transAxes)
+                axes[plot_row_offset + 1, col_idx].set_xticks([]); axes[plot_row_offset + 1, col_idx].set_yticks([])
+
+
+    # --- Add Colorbars ---
+    # Determine which mappable to use for the main temperature colorbar
+    # If PINN temps are very low, its range might be too narrow.
+    # Prefer GT range if available and wider, otherwise PINN range.
+    temp_mappable_for_cbar = None
+    label_for_temp_cbar = "Temperature (K)"
+
+    if 'cont_pinn_tv' in locals() and cont_pinn_tv is not None: # Ensure it exists
+        if has_gt_data and (vmax_gt - vmin_gt > vmax_pinn - vmin_pinn + 100): # If GT range is significantly wider
+            # Find the GT contourf object (less direct, might need better handling)
+            gt_contour_obj = axes[0,1].collections[0] if axes[0,1].collections else None
+            if gt_contour_obj: temp_mappable_for_cbar = gt_contour_obj; label_for_temp_cbar = "GT Temperature (K)"
+            else: temp_mappable_for_cbar = cont_pinn_tv; label_for_temp_cbar = "PINN Temperature (K)"
+        else:
+            temp_mappable_for_cbar = cont_pinn_tv # Default to PINN's first contour
+            label_for_temp_cbar = "PINN Temperature (K)" # Label reflects PINN range
+    
+    if temp_mappable_for_cbar:
+        cbar_temp_ax = fig.add_axes([0.93, 0.52, 0.015, 0.38])
+        fig.colorbar(temp_mappable_for_cbar, cax=cbar_temp_ax, label=label_for_temp_cbar)
+
+    # Diff colorbar (only if GT data was present)
+    if has_gt_data:
+        diff_mappable_for_cbar = None 
+        for ax_row_idx in range(num_times * 2): 
+            current_ax_diff = axes[ax_row_idx, 2]
+            if current_ax_diff.collections: 
+                for coll in current_ax_diff.collections:
+                    if hasattr(coll, 'cmap') and coll.cmap.name == 'coolwarm': diff_mappable_for_cbar = coll; break
+                if diff_mappable_for_cbar: break
+        if diff_mappable_for_cbar:
+            cbar_diff_ax = fig.add_axes([0.93, 0.08, 0.015, 0.38])
+            fig.colorbar(diff_mappable_for_cbar, cax=cbar_diff_ax, label='PINN - GT (K)')
+
+    fig.suptitle(f"Temperature Field Comparison {title_suffix}", fontsize=16, y=0.99) # Reduced y slightly
+    plt.tight_layout(rect=[0, 0.01, 0.91, 0.97]) # rect=[left, bottom, right, top]
+    plt.show()
+
+
+def calculate_rmse(model, ground_truth_data_all, norm_params):
+    model.eval()
+    if ground_truth_data_all is None or ground_truth_data_all.size == 0:
+        print("No ground truth data to calculate RMSE.")
+        return float('nan')
+
+    x_gt_all_orig = ground_truth_data_all[:, 0]
+    y_gt_all_orig = ground_truth_data_all[:, 1]
+    z_gt_all_orig = ground_truth_data_all[:, 2]
+    t_gt_all_orig = ground_truth_data_all[:, 3]
+    T_gt_all_orig = ground_truth_data_all[:, 4]
+
+    xn_gt_all, yn_gt_all, zn_gt_all, tn_gt_all = norm_params['normalize_coords'](
+        x_gt_all_orig, y_gt_all_orig, z_gt_all_orig, t_gt_all_orig
+    )
+
+    batch_size = 100000 
+    T_pinn_at_gt_all = []
+    with torch.no_grad():
+        for i in range(0, len(xn_gt_all), batch_size):
+            xn_batch = torch.tensor(xn_gt_all[i:i+batch_size], dtype=torch.float32).reshape(-1,1).to(DEVICE)
+            yn_batch = torch.tensor(yn_gt_all[i:i+batch_size], dtype=torch.float32).reshape(-1,1).to(DEVICE)
+            zn_batch = torch.tensor(zn_gt_all[i:i+batch_size], dtype=torch.float32).reshape(-1,1).to(DEVICE)
+            tn_batch = torch.tensor(tn_gt_all[i:i+batch_size], dtype=torch.float32).reshape(-1,1).to(DEVICE)
+            
+            Tn_pinn_batch = model(xn_batch, yn_batch, zn_batch, tn_batch)
+            T_pinn_batch_denorm = norm_params['denormalize_T'](Tn_pinn_batch.cpu().numpy())
+            T_pinn_at_gt_all.append(T_pinn_batch_denorm)
+    
+    T_pinn_at_gt_all_flat = np.concatenate(T_pinn_at_gt_all).squeeze()
+    
+    if T_pinn_at_gt_all_flat.shape != T_gt_all_orig.shape:
+        print(f"Warning: Shape mismatch for RMSE. PINN: {T_pinn_at_gt_all_flat.shape}, GT: {T_gt_all_orig.shape}")
+        min_len = min(len(T_pinn_at_gt_all_flat), len(T_gt_all_orig))
+        T_pinn_at_gt_all_flat = T_pinn_at_gt_all_flat[:min_len]
+        T_gt_all_orig_comp = T_gt_all_orig[:min_len]
+    else:
+        T_gt_all_orig_comp = T_gt_all_orig
+
+    rmse = np.sqrt(np.mean((T_pinn_at_gt_all_flat - T_gt_all_orig_comp)**2))
+    print(f"Overall RMSE between PINN and Ground Truth: {rmse:.2f} K")
+    return rmse
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    (xn_data_all_norm, yn_data_all_norm, zn_data_all_norm, tn_data_all_norm), \
+    Tn_data_all_norm, norm_params, raw_data_all_m = \
+        load_and_preprocess_data(
+            DATA_FILE_PATH, 
+            scale_coords_to_m=True,
+            expected_physical_peak_temp=3300.0 
+        )
+
+    layers = [4, 64, 64, 64, 1]
+    # --- Parameters for Aggressive Pattern Test ---
+    epochs_fwd_aux_debug = 5000
+    lr = 1e-4
+    log_every_epochs = 100 # Log every 100 epochs
+    
+    N_c = 20000  
+    # --- Modified N_b point counts ---
+    N_b_surf_top = 5000
+    N_b_surf_sides_bottom = 1000 # This will be used for EACH of the other 5 surfaces
+    
+    N_ic = 5000
+    N_data_aux = 2000000
+
+    # Sample physics-based points
+    xn_c, yn_c, zn_c, tn_c = sample_collocation_points(N_c, norm_params, DEVICE)
+    # --- Call modified sample_boundary_points ---
+    xn_b, yn_b, zn_b, tn_b = sample_boundary_points(N_b_surf_top, N_b_surf_sides_bottom, norm_params, DEVICE)
+    xn_ic, yn_ic, zn_ic, tn_ic = sample_initial_points(N_ic, norm_params, DEVICE)
+
+    # Prepare SHUFFLED auxiliary data
+    xn_d_hybrid, yn_d_hybrid, zn_d_hybrid, tn_d_hybrid, Tn_actual_d_hybrid = None, None, None, None, None
+    if Tn_data_all_norm is not None and len(Tn_data_all_norm) > 0 :
+        num_available_data = len(Tn_data_all_norm)
+        # print(f"INFO: Total available data points for aux sampling: {num_available_data}") # Already printed
+        all_indices = np.arange(num_available_data); np.random.shuffle(all_indices)
+        num_to_sample_aux = min(N_data_aux, num_available_data)
+        if num_to_sample_aux > 0:
+            idx_aux = all_indices[:num_to_sample_aux].astype(int)
+            xn_d_hybrid = torch.tensor(xn_data_all_norm[idx_aux], dtype=torch.float32).unsqueeze(1).to(DEVICE)
+            yn_d_hybrid = torch.tensor(yn_data_all_norm[idx_aux], dtype=torch.float32).unsqueeze(1).to(DEVICE)
+            zn_d_hybrid = torch.tensor(zn_data_all_norm[idx_aux], dtype=torch.float32).unsqueeze(1).to(DEVICE)
+            tn_d_hybrid = torch.tensor(tn_data_all_norm[idx_aux], dtype=torch.float32).unsqueeze(1).to(DEVICE)
+            Tn_actual_d_hybrid = torch.tensor(Tn_data_all_norm[idx_aux], dtype=torch.float32).unsqueeze(1).to(DEVICE)
+            # print(f"Using {num_to_sample_aux} (SHUFFLED) auxiliary data points for training (though data_weight is low).") # Already printed
+            # print(f"  Stats of selected aux T_norm: min={Tn_actual_d_hybrid.min().item():.3f}, max={Tn_actual_d_hybrid.max().item():.3f}, mean={Tn_actual_d_hybrid.mean().item():.3f}") # Already printed
+        else: print("Warning: Not enough data points to sample for auxiliary training.")
+    else: print("Warning: Tn_data_all_norm is None or empty. Cannot use auxiliary data.")
+
+    # --- Instantiate PINN ---
+    title_run_description = f"PatternTest_BCw100_PDEw5_Dataw0.01_LR1e-4_HotF1_SideBCScale1e4_TopBCScale5e5_MoreTopPts" 
+    print(f"\n--- AGGRESSIVE PATTERN TEST ({title_run_description}) ---")
+    pinn_hybrid = PINN(layers).to(DEVICE)
+
+    optimizer_hybrid = torch.optim.Adam(pinn_hybrid.parameters(), lr=lr)
+    scheduler_hybrid = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_hybrid, 'min', patience=200, factor=0.7, verbose=False, min_lr=1e-7) # verbose=False
+    
+    # --- AGGRESSIVE Loss Weights for pattern test ---
+    loss_weights_hybrid = {'pde': 20.0, 'bc': 100.0, 'ic': 10.0, 'data': 100}
+    print(f"Using AGGRESSIVE loss weights: {loss_weights_hybrid}")
+    
+    history_hybrid = train_pinn(pinn_hybrid, optimizer_hybrid, epochs_fwd_aux_debug,
+                                xn_c, yn_c, zn_c, tn_c,
+                                xn_b, yn_b, zn_b, tn_b,
+                                xn_ic, yn_ic, zn_ic, tn_ic,
+                                xn_d_hybrid, yn_d_hybrid, zn_d_hybrid, tn_d_hybrid, Tn_actual_d_hybrid,
+                                norm_params, weights=loss_weights_hybrid, scheduler=scheduler_hybrid, 
+                                log_every=log_every_epochs) # Use variable
+    
+    if history_hybrid['loss']: # Check if training produced any loss history
+        plot_loss_history(history_hybrid, f"Loss History - {title_run_description}")
+        model_to_plot = pinn_hybrid
+        model_to_plot.eval()
+        num_test_pts = 20000
+        xn_test, yn_test, zn_test, tn_test = sample_collocation_points(num_test_pts, norm_params, DEVICE) # Sample some domain points
+        with torch.no_grad():
+            Tn_pinn_test_output = model_to_plot(xn_test, yn_test, zn_test, tn_test)
+            T_pinn_test_denorm = norm_params['denormalize_T'](Tn_pinn_test_output.cpu().numpy())
+        
+        print(f"\nDEBUG PINN PREDICTIONS (Random Domain Points for Plotting Check):")
+        print(f"  Min predicted T (denormalized): {np.min(T_pinn_test_denorm):.2f} K")
+        print(f"  Max predicted T (denormalized): {np.max(T_pinn_test_denorm):.2f} K")
+        print(f"  Mean predicted T (denormalized): {np.mean(T_pinn_test_denorm):.2f} K")
+        print(f"  Median predicted T (denormalized): {np.median(T_pinn_test_denorm):.2f} K")
+        
+        # Also check points on the top surface specifically at a relevant time
+        N_top_surface_test = 2000
+        x_top_test_norm = torch.rand(N_top_surface_test, 1, device=DEVICE) * 2 - 1
+        y_top_test_norm = torch.rand(N_top_surface_test, 1, device=DEVICE) * 2 - 1
+        z_top_test_norm = torch.ones_like(x_top_test_norm) * 1.0 # z_norm = 1 (top)
+        t_val_for_test = 1.5 # s
+        _, _, _, t_top_test_norm_singleval = norm_params['normalize_coords'](0,0,0, t_val_for_test)
+        t_top_test_norm = torch.ones_like(x_top_test_norm) * t_top_test_norm_singleval
+        
+        with torch.no_grad():
+            Tn_pinn_top_test = model_to_plot(x_top_test_norm, y_top_test_norm, z_top_test_norm, t_top_test_norm)
+            T_pinn_top_test_denorm = norm_params['denormalize_T'](Tn_pinn_top_test.cpu().numpy())
+        print(f"DEBUG PINN PREDICTIONS (Top Surface @ t={t_val_for_test}s):")
+        print(f"  Min predicted T_top: {np.min(T_pinn_top_test_denorm):.2f} K")
+        print(f"  Max predicted T_top: {np.max(T_pinn_top_test_denorm):.2f} K")
+        print(f"  Mean predicted T_top: {np.mean(T_pinn_top_test_denorm):.2f} K")
+        
+        plot_temperature_comparison_detailed(pinn_hybrid, raw_data_all_m, norm_params,
+                                             time_instances_s=[0.5, 1.5, 2.5],
+                                             title_suffix=title_run_description)
+    else:
+        print(f"Training did not produce history for {title_run_description}.")
+
+    print(f"All Done with {title_run_description}.")
