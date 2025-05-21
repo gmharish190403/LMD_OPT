@@ -833,7 +833,7 @@ if __name__ == "__main__":
 
     layers = [4, 64, 64, 64, 1]
     # --- Parameters for Aggressive Pattern Test ---
-    epochs_fwd_aux_debug = 5000
+    epochs_fwd_aux_debug = 50000
     lr = 1e-4
     log_every_epochs = 100 # Log every 100 epochs
     
